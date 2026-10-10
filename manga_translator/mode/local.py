@@ -8,13 +8,17 @@ import time
 from PIL import Image
 import psutil
 
+import tkinter as tk
+import threading
+import queue
+
 from manga_translator import MangaTranslator, Context, TranslationInterrupt, Config
 from ..save import save_result
 from ..translators import (
     LanguageUnsupportedException,
     dispatch as dispatch_translation,
 )
-from ..utils import natural_sort, replace_prefix, get_color_name, rgb2hex, get_logger
+from ..utils import natural_sort, replace_prefix, get_color_name, rgb2hex, get_logger, LiveEditor, image_stream_queue, shutdown_event
 
 # 使用专用的local logger
 logger = get_logger('local')
@@ -69,7 +73,35 @@ def force_cleanup():
         ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1, -1)
     except:
         pass
+        
+def poll_incoming_stream_queue(editor_widget):
+    """Periodically drains incoming rendered contexts from the translation pipeline."""
+    try:
+        while True:
+            new_ctx, path = image_stream_queue.get_nowait()
+            image_stream_queue.task_done
+            editor_widget.append_image(image_dict=copy.deepcopy(new_ctx), path=path)
+    except queue.Empty:
+        pass
+    editor_widget.master.after(100, lambda: poll_incoming_stream_queue(editor_widget))
 
+
+def spawn_detached_editor_ui(initial_images=None):
+    """Runs the Tkinter event loop in a dedicated GUI thread."""
+    root = tk.Tk()
+    root.title("Live Stream Editor")
+    root.geometry("1280x720")
+
+    editor_widget = LiveEditor(root, initial_image_dict=initial_images)
+    editor_widget.pack(fill="both", expand=True)
+    editor_widget.register_close_protocol()
+
+    poll_incoming_stream_queue(editor_widget)
+    root.mainloop()
+
+    shutdown_event.set()
+    #subprocess.run(["killall", "python"])
+    
 class MangaTranslatorLocal(MangaTranslator):
     def __init__(self, params: dict = None):
         super().__init__(params)
@@ -84,7 +116,14 @@ class MangaTranslatorLocal(MangaTranslator):
         self.prep_manual = params.get('prep_manual', None)
         self.batch_size = params.get('batch_size', 1)
         self.disable_memory_optimization = params.get('disable_memory_optimization', False)
-
+        self.ui_thread = threading.Thread(
+            target=spawn_detached_editor_ui,
+            args=(None,),
+            daemon=False #todo True
+        )
+        self.ui_thread.start()
+        #todo self.ui_thread.join()
+        
     async def translate_path(self, path: str, dest: str = None, params: dict[str, Union[int, str]] = None):
         """
         Translates an image or folder (recursively) specified through the path.
@@ -267,6 +306,9 @@ class MangaTranslatorLocal(MangaTranslator):
             ctx = await self.translate(img, config)
             result = ctx.result
 
+            if ctx.img_inpainted is not None: # and params.get('use-mtpe-tk'):
+                image_stream_queue.put((ctx,dest))
+                
             # TODO
             # Proper way to use the config but for now juste pass what we miss here ton ctx
             # Because old methods are still using for example ctx.gimp_font
