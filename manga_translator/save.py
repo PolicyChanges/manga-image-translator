@@ -60,7 +60,7 @@ class JPGFormat(ExportFormat):
         result.save(dest, quality=ctx.save_quality, format='JPEG')
 
 class GIMPFormat(ExportFormat):
-    SUPPORTED_FORMATS = ['xcf', 'psd', 'pdf']
+    SUPPORTED_FORMATS = ['xc<f', 'psd', 'pdf']
 
     def _save(self, result: Image.Image, dest: str, ctx: Context):
         gimp_render(dest, ctx)

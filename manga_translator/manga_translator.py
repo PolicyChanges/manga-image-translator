@@ -1199,8 +1199,8 @@ class MangaTranslator:
 
                 # 强制替换规则
                 # Forced replacement rules
-                for v in replace_items:
-                    region.translation = region.translation.replace(v[1], v[0])
+                #for v in replace_items:
+                #    region.translation = region.translation.replace(v[1], v[0])
 
         # 注意：翻译结果的保存移动到了翻译流程的最后，确保保存的是最终结果而不是重试前的结果
 

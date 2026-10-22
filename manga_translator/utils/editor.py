@@ -1,21 +1,326 @@
 import os
+import sys
+import json
+import asyncio
+import websockets
+import pathlib
 import platform
 import subprocess
 import threading
 import queue
+import cv2
+import freetype
+import glob
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-import cv2
-import freetype
+
 import numpy as np
 from PIL import Image, ImageTk
+
 import tkinter as tk
 from tkinter import colorchooser, filedialog, ttk
 
-from .textblock import TextBlock
+from ..config import Config
 from ..rendering import text_render
+from ..rendering.ballon_extractor import extract_ballon_region
+from .textblock import TextBlock
 from ..utils import BASE_PATH, rect_distance
+import bisect
+from ..utils import natural_sort  # Use the project's existing natural sort utility if available
+import re
+
+def natural_sort_key(s: str):
+    """Generates an alphanumeric sorting key split (e.g., 'page_10' comes after 'page_2')"""
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', str(s))]
+
+# --- Global Registries ---
+_ACTIVE_EDITOR_WIDGET = None
+_SERVER_LOOP = None
+_RESOLVED_FONT_PATH = None
+
+def register_editor_instance(instance):
+    """Binds the active Tkinter editor widget to our WebSocket IPC server."""
+    global _ACTIVE_EDITOR_WIDGET
+    _ACTIVE_EDITOR_WIDGET = instance
+
+def discover_global_font_path() -> str:
+    """
+    Dynamically tracks the target font asset across command line arguments,
+    JSON config declarations, and system defaults.
+    """
+    global _RESOLVED_FONT_PATH
+    if _RESOLVED_FONT_PATH is not None:
+        return _RESOLVED_FONT_PATH
+
+    # 1. Fallback default font token specification
+    fallback_font = "fonts/Arial-Unicode-Regular.ttf"
+    
+    # 2. Check Command Line Arguments directly
+    if '--font-path' in sys.argv:
+        try:
+            idx = sys.argv.index('--font-path')
+            if idx + 1 < len(sys.argv):
+                target = sys.argv[idx + 1]
+                if os.path.exists(target):
+                    _RESOLVED_FONT_PATH = target
+                    return _RESOLVED_FONT_PATH
+        except Exception:
+            pass
+
+    # 3. Check JSON Configuration Mapping profiles
+    config_file_path = None
+    if '--config-file' in sys.argv:
+        try:
+            idx = sys.argv.index('--config-file')
+            if idx + 1 < len(sys.argv):
+                config_file_path = sys.argv[idx + 1]
+        except Exception:
+            pass
+            
+    if config_file_path and os.path.exists(config_file_path):
+        try:
+            with open(config_file_path, 'r', encoding='utf-8') as f:
+                cfg_data = json.load(f)
+                # Parse standard manga-translator JSON schema nesting layouts
+                font_opt = cfg_data.get('font_path') or cfg_data.get('render', {}).get('gimp_font')
+                if font_opt and os.path.exists(str(font_opt)):
+                    _RESOLVED_FONT_PATH = str(font_opt)
+                    return _RESOLVED_FONT_PATH
+        except Exception:
+            pass
+
+    # 4. Enforce system default path resolution
+    _RESOLVED_FONT_PATH = fallback_font if os.path.exists(fallback_font) else "Arial"
+    return _RESOLVED_FONT_PATH
+
+def get_system_and_fallback_fonts():
+    """
+    Scans typical system directories and internal configurations to build 
+    a dictionary of available { "Font Name": "/absolute/path/to/font.ttf" }.
+    """
+    font_map = {}
+    
+    # 1. Register explicitly configured application fallbacks first
+    fallback_dir = "fonts"
+    if os.path.isdir(fallback_dir):
+        for f_path in glob.glob(os.path.join(fallback_dir, "*.ttf")):
+            name = os.path.splitext(os.path.basename(f_path))[0]
+            font_map[f"{name} (App Fallback)"] = f_path.replace('\\', '/')
+
+    # 2. Fast OS-Agnostic System Directory Scanning Paths
+    search_paths = [
+        "/usr/share/fonts",                          # Linux standard system fonts path
+        "/usr/local/share/fonts",                    # Custom user linux paths
+        "~/.fonts",                                  # Local user linux path profile
+        "/System/Library/Fonts",                     # macOS base framework fonts directory
+        "/Library/Fonts",                            # macOS global applications font space
+        "~/Library/Fonts",                           # macOS local user profile fonts path
+        os.path.expandvars(r"%WINDIR%\Fonts"),       # Windows native operating system fonts layout
+    ]
+
+    for raw_path in search_paths:
+        resolved_path = os.path.expanduser(raw_path)
+        if os.path.isdir(resolved_path):
+            for ext in ('*.ttf', '*.otf', '*/*.ttf', '*/*.otf'):
+                for f_path in glob.glob(os.path.join(resolved_path, ext)):
+                    base_name = os.path.splitext(os.path.basename(f_path))[0]
+                    if base_name not in font_map:
+                        font_map[base_name] = f_path.replace('\\', '/')
+
+    if not font_map:
+        font_map["Arial-Unicode-Regular"] = "fonts/Arial-Unicode-Regular.ttf"
+        
+    return font_map
+
+class ReconstitutedNamespace:
+    """
+    Dynamically wraps dictionaries into dot-notation lookups (e.g., r.translation).
+    Enforces clean, guaranteed 3-element integer arrays for color attributes
+    even when accessed directly via dot notation (e.g., region.fg_colors).
+    """
+    def __init__(self, dictionary):
+        for key, value in dictionary.items():
+            if isinstance(value, dict):
+                setattr(self, key, ReconstitutedNamespace(value))
+            elif isinstance(value, list):
+                if key in ('xyxy', 'xywh') and value:
+                    setattr(self, key, np.array(value, dtype=np.float32))
+                elif key in ('bg_colors', 'fg_colors') and value:
+                    # Parse color arrays immediately on initialization
+                    setattr(self, key, self._normalize_color(value))
+                else:
+                    setattr(self, key, [ReconstitutedNamespace(i) if isinstance(i, dict) else i for i in value])
+            else:
+                # Handle raw scalars if passed in dictionary attributes
+                if key in ('bg_colors', 'fg_colors'):
+                    setattr(self, key, self._normalize_color(value))
+                else:
+                    setattr(self, key, value)
+
+    def _normalize_color(self, color_val, default_val=None):
+        """Helper to safely format any incoming variant into a 3-channel BGR vector."""
+        if default_val is None:
+            default_val = np.array([0, 0, 0], dtype=np.uint8)
+            
+        if isinstance(color_val, np.ndarray):
+            flat = color_val.flatten()
+            if flat.size >= 3:
+                return flat[:3].astype(np.uint8)
+            elif flat.size > 0:
+                return np.array([flat[0], flat[0], flat[0]], dtype=np.uint8)
+        elif isinstance(color_val, (list, tuple)):
+            if len(color_val) >= 3:
+                return np.array(color_val[:3], dtype=np.uint8)
+            elif len(color_val) > 0:
+                return np.array([color_val[0], color_val[0], color_val[0]], dtype=np.uint8)
+        elif isinstance(color_val, (int, float)):
+            val = int(color_val)
+            return np.array([val, val, val], dtype=np.uint8)
+            
+        return default_val
+                
+    def get_font_colors(self):
+        """Mimics the original TextRegion class method."""
+        # Grab properties directly from internal namespace mapping 
+        font_color = self.__dict__.get('fg_colors', np.array([0, 0, 0], dtype=np.uint8))
+        stroke_color = self.__dict__.get('bg_colors', np.array([255, 255, 255], dtype=np.uint8))
+        return font_color, stroke_color
+
+    def set_fg_colors(self, col):
+        """Mimics the original TextRegion class method."""
+        # Grab properties directly from internal namespace mapping 
+        self.__dict__['fg_colors'] = col #, np.array([0, 0, 0], dtype=np.uint8))
+        self.__dict__['font_color'] = col #, np.array([255, 255, 255], dtype=np.uint8))
+        return
+
+    def set_bg_colors(self, col):
+        self.__dict__['bg_colors'] = col
+        self.__dict__['stroke_color'] = col
+        return
+
+    def __getattr__(self, name):
+        # Fallback vectors to ensure index layout routines never crash if fields are empty
+        if name in ('xyxy', 'xywh'):
+            return np.zeros((4,), dtype=np.float32)
+        elif name == 'fg_colors':
+            return np.array([0, 0, 0], dtype=np.uint8)
+        elif name == 'bg_colors':
+            return np.array([255, 255, 255], dtype=np.uint8)
+        return ""
+
+async def pure_websocket_handler(websocket):
+    """
+    Pure Python WebSocket connection router. Handles extraction 
+    and reconstruction of image structures, tracking hardware metrics.
+    Defensively enforces unique data isolation to prevent image-repeating bugs.
+    """
+    try:
+        async for packet_bytes in websocket:
+            if len(packet_bytes) < 8:
+                continue
+                
+            # 1. Parse custom multi-part offset boundaries 
+            json_len = int.from_bytes(packet_bytes[0:4], byteorder='big')
+            rgb_len = int.from_bytes(packet_bytes[4:8], byteorder='big')
+            
+            meta_start = 8
+            meta_end = meta_start + json_len
+            rgb_start = meta_end
+            rgb_end = rgb_start + rgb_len
+            inpainted_start = rgb_end
+            
+            # 2. Extract alphanumeric payload properties
+            metadata_payload = json.loads(packet_bytes[meta_start:meta_end].decode('utf-8'))
+            path_string = metadata_payload.get("dest")
+            config_data = metadata_payload.get("config")
+
+            image_dict = metadata_payload.get("ctx", {})
+            if not isinstance(image_dict, dict):
+                image_dict = {"raw_data": image_dict}
+            
+            # 3. Decompress binary frame allocations back to NumPy array grids
+            if metadata_payload.get("has_rgb") and rgb_len > 0:
+                rgb_buf = np.frombuffer(packet_bytes[rgb_start:rgb_end], dtype=np.uint8)
+                image_dict["img_rgb"] = cv2.imdecode(rgb_buf, cv2.IMREAD_COLOR)
+            else:
+                image_dict["img_rgb"] = None
+
+            if metadata_payload.get("has_inpainted"):
+                inpainted_buf = np.frombuffer(packet_bytes[inpainted_start:], dtype=np.uint8)
+                image_dict["img_inpainted"] = cv2.imdecode(inpainted_buf, cv2.IMREAD_COLOR)
+            else:
+                image_dict["img_inpainted"] = None
+
+            # 4. Reconstitute dictionary mappings to support dot-notation properties safely
+            raw_regions = image_dict.get('text_regions') or []
+            image_dict['text_regions'] = [ReconstitutedNamespace(r) if isinstance(r, dict) else r for r in raw_regions]
+
+            # ----------------------------------------------------
+            # WARM-UP FILTER PASSTHROUGH HOOK
+            # ----------------------------------------------------
+            is_warmup = (
+                "warmup" in str(path_string).lower() or 
+                config_data is None or
+                image_dict.get("img_inpainted") is None or 
+                image_dict.get("img_rgb") is None
+            )
+
+            if is_warmup:
+                print(f"[IPC Network Server] Completed a pre-warming loop lock frame. Discarding placeholder payload safely.")
+                await websocket.send(json.dumps({"status": "acknowledged"}))
+                continue
+
+            # ----------------------------------------------------
+            # ANTI-BLEED DATA CLEANUP HOOK
+            # ----------------------------------------------------
+            if _ACTIVE_EDITOR_WIDGET is not None:
+                try:
+                    if hasattr(_ACTIVE_EDITOR_WIDGET, '_tk_overlay_cache'):
+                        _ACTIVE_EDITOR_WIDGET._tk_overlay_cache.clear()
+                    
+                    normalized_path = os.path.normpath(str(path_string))
+                    
+                    # 5. Hand the real structural payload directly to the registered UI widget
+                    _ACTIVE_EDITOR_WIDGET.append_image(image_dict, path=normalized_path, config=config_data)
+                except Exception as append_err:
+                    print(f"[IPC Server Error] Failed to execute append_image: {append_err}", file=sys.stderr)
+            else:
+                print(f"[Server Warning] Context received, but no active editor layout is bound.")
+
+            # Send sync loop status validation acknowledgement frame pulse back
+            await websocket.send(json.dumps({"status": "acknowledged"}))
+            
+            # --- MANDATORY MEMORY PURGE ---
+            del image_dict
+            del packet_bytes
+            
+    except Exception as e:
+        print(f"[IPC Server Error] Stream processing exception encountered: {e}", file=sys.stderr)
+
+async def main_server_async(host, port):
+    """Initializes websockets.serve within an active running loop layout block."""
+    async with websockets.serve(
+        pure_websocket_handler, 
+        host, 
+        port, 
+        max_size=None,
+        ping_interval=None
+    ) as server:
+        print(f"[IPC Network Server] Server actively listening for GPU worker nodes on ws://{host}:{port}")
+        await asyncio.Future()  # Keeps the async server run context open indefinitely
+
+def run_async_server_loop(host, port):
+    """Runs the asyncio network loop indefinitely inside a background thread context."""
+    global _SERVER_LOOP
+    _SERVER_LOOP = asyncio.new_event_loop()
+    asyncio.set_event_loop(_SERVER_LOOP)
+    
+    try:
+        _SERVER_LOOP.run_until_complete(main_server_async(host, port))
+    except Exception as e:
+        print(f"[IPC Server Fatal initialization crash Error]: {e}", file=sys.stderr)
+
 
 image_stream_queue: queue.Queue = queue.Queue()
 shutdown_event: threading.Event = threading.Event()
@@ -90,14 +395,16 @@ def render_lines(
         pen_orig[1] += spacing_y + font_size
 
     canvas_border = np.clip(canvas_border, 0, 255)
+    
     line_box = text_render.add_color(canvas_text, fg, canvas_border, bg)
 
     x, y, width, height = cv2.boundingRect(canvas_border)
     if width <= 0 or height <= 0:
         return None
-
-    return Image.fromarray(line_box[y:y + height, x:x + width])
-
+        
+    # Enforce integer casts to fix the slice indices TypeError
+    x, y, w, h = int(x), int(y), int(width), int(height)
+    return Image.fromarray(line_box[y:y + h, x:x + w])
 
 def seg_eng(text: str) -> List[str]:
     text = text.strip().upper().replace('  ', ' ').replace(' .', '.').replace('\n', ' ')
@@ -151,7 +458,6 @@ def seg_eng(text: str) -> List[str]:
         words.append(word)
 
     return words
-
 
 def layout_lines_aligncenter(
     mask: np.ndarray,
@@ -310,43 +616,68 @@ def layout_lines_aligncenter(
 
     return lines
 
-
 def render_textblock_list_eng_rendered(
     img: np.ndarray,
     text_regions: List[TextBlock],
-    rendered_text_list: Optional[List] = None,
-    rendered_text_coords: Optional[List] = None,
     delimiter: str = ' ',
     line_spacing: float = 0.01,
     stroke_width: float = 0.1,
     ballonarea_thresh: float = 2.0,
     downscale_constraint: float = 0.7,
     original_img: Optional[np.ndarray] = None,
-    disable_font_border: bool = False
-    #downscale_font_size: float = 1.0
-) -> Tuple[List, List]:
-    if rendered_text_list is None:
-        rendered_text_list = []
-    if rendered_text_coords is None:
-        rendered_text_coords = []
-        
-    #for text_region in text_regions:
-    #    text_region.font_size=int(text_region.font_size*downscale_font_size)
-        
-    def calculate_font_values(f_size: int, words_in: List[str]):
-        f_size = int(f_size)
-        sw = int(f_size * stroke_width)
-        line_height = int(f_size * 0.8)
-        delim_glyph = text_render.get_char_glyph(delimiter, f_size, 0)
-        delim_len = delim_glyph.advance.x >> 6
-        b_length = -1
-        w_lengths = []
-        for word in words_in:
-            w_len = sum((text_render.get_char_glyph(c, f_size, 0).metrics.horiAdvance >> 6) for c in word)
-            w_lengths.append(w_len)
-            if w_len > b_length:
-                b_length = w_len
-        return f_size, sw, line_height, delim_len, b_length, w_lengths
+    disable_font_border: bool = False,
+    font_path: str = discover_global_font_path(),
+    force_font_size: int = -1, ) -> Tuple[List, List]:
+
+    rendered_text_list = []
+    rendered_text_coords = []
+    
+    #if (fg_colors != [-1,-1,-1]):
+    #    text_regions[0].fg_colors = fg_colors
+    #if (bg_colors != [-1,-1,-1]):
+    #    text_regions[0].bg_colors = bg_colors   
+
+    def calculate_font_values(font_size: int, words: List[str], f_size=None):
+        # Ensure your base font size metrics tracking references are resolved cleanly
+        if f_size is None:
+            f_size = font_size
+        # Assuming your original font rendering subsystem uses a global load or set hook:
+        # e.g., from manga_translator.rendering.text_render import set_global_font
+        text_render.set_font(font_path)
+
+        sw = int(font_size * stroke_width)
+        line_height = int(font_size * 0.8)
+        #delimiter_glyph = text_render.get_char_glyph(delimiter, font_size, 0)
+        #delimiter_len = delimiter_glyph.advance.x >> 6
+        delimiter_glyph = text_render.get_char_glyph(' ', f_size, 0)
+        if delimiter_glyph is not None and hasattr(delimiter_glyph, 'advance') and delimiter_glyph.advance is not None:
+            delimiter_len = delimiter_glyph.advance.x >> 6
+        else:
+            # Scale spacing safely relative to the target font sizing parameters
+            delimiter_len = max(2, int(f_size * 0.25))
+
+        word_pixel_lengths = []
+        base_length = -1
+        word_lengths = []
+        for word in words:
+            word_length = 0
+            for cdpt in word:
+                glyph = text_render.get_char_glyph(cdpt, f_size, 0)
+                
+                if glyph is not None and hasattr(glyph, 'metrics') and glyph.metrics is not None:
+                    char_offset_x = glyph.metrics.horiAdvance >> 6
+                    word_pixel_lengths.append(char_offset_x)
+                else:
+                    char_offset_x = max(2, int(f_size * 0.55))
+                    word_pixel_lengths.append(char_offset_x)
+                    # Scale spacing safely relative to the target font sizing parameters
+                char_offset_x = glyph.metrics.horiAdvance >> 6
+                word_length += char_offset_x
+            word_lengths.append(word_length)
+            if word_length > base_length:
+                base_length = word_length
+        #w_len = sum(word_pixel_lengths)
+        return font_size, sw, line_height, delimiter_len, base_length, word_lengths
 
     def update_enlarged_xyxy(reg):
         reg.enlarged_xyxy = reg.xyxy.copy()
@@ -359,7 +690,7 @@ def render_textblock_list_eng_rendered(
     for region in text_regions:
         region.enlarge_ratio = 1
         region.enlarged_xyxy = region.xyxy.copy()
-    
+
     for region in text_regions:
         if region.enlarge_ratio == 1:
             region.enlarge_ratio = min(max(region.xywh[2] / region.xywh[3], region.xywh[3] / region.xywh[2]) * 1.5, 3)
@@ -381,15 +712,29 @@ def render_textblock_list_eng_rendered(
         words = seg_eng(region.translation)
         if not words:
             continue
-
+        
         font_size, sw, line_height, delimiter_len, base_length, word_lengths = calculate_font_values(
             region.font_size, words
         )
+        
+        # Enforce that all coordinates inside xywh are strictly pure integers
+        safe_xywh = [int(round(float(c))) for c in region.xywh]
 
-        ballon_mask, xyxy = extract_ballon_region(original_img, region.xywh, enlarge_ratio=region.enlarge_ratio)
+        try:
+            # Cast enlarge_ratio to float just in case it's packaged weirdly
+            safe_enlarge_ratio = float(region.enlarge_ratio)
+
+            ballon_mask, xyxy = extract_ballon_region(
+                original_img.copy(), 
+                safe_xywh, 
+                enlarge_ratio=safe_enlarge_ratio
+            )
+        except Exception as e:
+            print(f"extract_ballon_region threw {e}")
+
         ballon_area = (ballon_mask > 0).sum()
         rotated, rx, ry = False, 0.0, 0.0
-
+    
         if abs(region.angle) > 3:
             rotated = True
             angle_rad = np.deg2rad(region.angle)
@@ -408,7 +753,7 @@ def render_textblock_list_eng_rendered(
             else:
                 rx = abs(ballon_mask.shape[0] * angle_sin)
             ballon_mask = rotated_ballon_mask
-
+        
         line_width = sum(word_lengths) + delimiter_len * (len(word_lengths) - 1)
         region_area = line_width * line_height + delimiter_len * (len(words) - 1) * line_height
         area_ratio = (ballon_area / region_area) if region_area > 0 else 1.0
@@ -431,9 +776,13 @@ def render_textblock_list_eng_rendered(
         base_length_word = words[base_word_idx]
         if not base_length_word:
             continue
+        
+        lines_needed = len(region.translation) / len(base_length_word) 
 
-        lines_needed = len(region.translation) / len(base_length_word)
-        lines_available = abs(xyxy[3] - xyxy[1]) // line_height + 1
+        # Enforce line_height is an integer for clean division math
+        l_height = int(line_height)
+        lines_available = int(abs(xyxy[3] - xyxy[1])) // l_height + 1
+
         font_size_multiplier = max(
             min(region_w / (base_length + 2 * sw), lines_available / lines_needed),
             downscale_constraint
@@ -464,20 +813,34 @@ def render_textblock_list_eng_rendered(
             line.pos_x -= canvas_x1
             line.pos_y -= canvas_y1
 
-        region_font_color, region_stroke_color = region.get_font_colors()
-        if getattr(region, 'fg_color', None) is not None:
-            region_font_color = region.fg_color
-        elif getattr(region, 'font_color', None) is not None:
-            region_font_color = region.font_color
+        
+        from .generic2 import color_difference, is_right_to_left_char, is_valuable_char
 
-        if getattr(region, 'bg_color', None) is not None:
-            region_stroke_color = region.bg_color
-        elif getattr(region, 'stroke_color', None) is not None:
-            region_stroke_color = region.stroke_color
+        # ----------------------------------------------------
+        # COLOR MATRIX RE-ALIGNMENT HOOK
+        # ----------------------------------------------------
+        # Force incoming color vectors to BGR layout for OpenCV rendering matrix layers
+        frgb = np.array(region.fg_colors).astype(np.int32).flatten()[:3]
+        brgb = np.array(region.bg_colors).astype(np.int32).flatten()[:3]
+
+        if region.adjust_bg_color:
+            fg_avg = np.mean(frgb)
+            if color_difference(frgb, brgb) < 30:
+                brgb = np.array([255, 255, 255]) if fg_avg <= 127 else np.array([0, 0, 0])
+
+        # If text color looks inverted or swapped, convert RGB to BGR for the renderer:
+        region_font_color = frgb #(int(frgb[2]), int(frgb[1]), int(frgb[0]))   # R, G, B -> B, G, R
+        region_stroke_color = brgb #(int(brgb[2]), int(brgb[1]), int(brgb[0])) # R, G, B -> B, G, R
+
+        if force_font_size != -1:
+            font_size = force_font_size
 
         textlines_image = render_lines(
             textlines, canvas_h, canvas_w, font_size, sw, line_spacing, region_font_color, region_stroke_color
         )
+
+        region.font_size = font_size
+
         if textlines_image is None:
             continue
 
@@ -495,12 +858,47 @@ def render_textblock_list_eng_rendered(
 
         abs_x = int(rel_cx + xyxy[0] - textlines_image.width / 2)
         abs_y = int(rel_cy + xyxy[1] - textlines_image.height / 2)
-
+        
         rendered_text_list.append(textlines_image)
         rendered_text_coords.append((abs_x, abs_y))
 
     return rendered_text_list, rendered_text_coords
 
+def render_textblock_list_ch_rendered(
+    img: np.ndarray,
+    text_regions: List[TextBlock],
+    font_path: str = '',
+    font_size_fixed: int = None,
+    font_size_offset: int = 0,
+    font_size_minimum: int = 0,
+    hyphenate: bool = True,
+    render_mask: np.ndarray = None,
+    line_spacing: int = None,
+    disable_font_border: bool = False ) -> np.ndarray:
+    from ..rendering import render, resize_regions_to_font_size 
+    from tqdm import tqdm
+    text_render.set_font(font_path)
+    text_regions = list(filter(lambda region: region.translation, text_regions))
+
+    # Resize regions that are too small
+    dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum)
+
+    # TODO: Maybe remove intersections
+
+    img = img.copy() # Don't overwrite img_inpainted
+    text_render_list = []
+    text_render_coords = []
+    # Render text
+    for region, dst_points in tqdm(zip(text_regions, dst_points_list), '[render]', total=len(text_regions)):
+        if render_mask is not None:
+            # set render_mask to 1 for the region that is inside dst_points
+            cv2.fillConvexPoly(render_mask, dst_points.astype(np.int32), 1)  
+        new_text_img = render(img, region, dst_points, hyphenate, line_spacing, disable_font_border)
+        from PIL import Image
+        Image.fromarray(new_text_img).show()
+        text_render_coords.append(dst_points)
+        text_render_list.append(new_text_img)
+    return text_render_list, text_render_coords
 
 class LiveEditor(tk.Frame):
     def __init__(self, master, initial_image_dict=None, **kwargs):
@@ -529,27 +927,60 @@ class LiveEditor(tk.Frame):
         self.bg_color_pick_btn: Optional[tk.Button] = None
         self.layer_text_display: Optional[tk.Entry] = None
         self.render_btn: Optional[tk.Button] = None
+        self.show_bboxes_active = False  # Toggle tracking state for bounding boxes
+        self.property_box_has_focus = False  # Blocks canvas events when typing in properties
+        self._saved_property_box_geometry = None  # Remembers custom property box window coordinates
+        self.is_fullscreen = False  # Newly added state tracker for window presentation modes
+
 
         self.current_fg_color: Tuple[int, int, int] = (0, 0, 0)
         self.current_bg_color: Tuple[int, int, int] = (255, 255, 255)
 
+        self.current_font_path = discover_global_font_path()
+
         self._build_top_controls()
         self._build_main_workspace()
-
+        self.timer = None
         if initial_image_dict:
             self.append_image(initial_image_dict)
         else:
             self._show_placeholder_text()
 
-        self.bind_all("<Left>", self._on_arrow_left_press)
-        self.bind_all("<Right>", self._on_arrow_right_press)
+        # Re-mapped page turn workflows to Alt + Arrow combinations to stay clear of nudge keys
+        self.bind_all("<Alt-Left>", lambda e: self._on_arrow_left_press(e) if not self.property_box_has_focus else None)
+        self.bind_all("<Alt-Right>", lambda e: self._on_arrow_right_press(e) if not self.property_box_has_focus else None)
 
+        self.zoom_scale = -1.0         # 1.0 represents 100% native size resolution
+        self.min_zoom = 0.15           # Minimum 20% downscale limit
+        self.max_zoom = 4.0            # Maximum 400% upscale threshold
+        
+        # Bind the unified Ctrl + Mouse Wheel event listeners cleanly
+        self.canvas.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel_zoom)
+        self.canvas.bind("<Control-Button-4>", self._on_ctrl_mousewheel_zoom)
+        self.canvas.bind("<Control-Button-5>", self._on_ctrl_mousewheel_zoom)
+
+        # Bind background canvas clicks to clear selection and close properties
+        self.canvas.bind("<Button-1>", self._on_canvas_background_click)
+        
+        # --- KEYBOARD NUDGE SHORTCUT BINDINGS ---
+        # Intercepts arrow keys to micro-adjust selected text block positions
+        self.bind_all("<Up>", lambda e: self._on_keyboard_nudge(0, -1, e))
+        self.bind_all("<Down>", lambda e: self._on_keyboard_nudge(0, 1, e))
+        self.bind_all("<Left>", lambda e: self._on_keyboard_nudge(-1, 0, e))
+        self.bind_all("<Right>", lambda e: self._on_keyboard_nudge(1, 0, e))
+
+        # Shift + Arrow Keys for fast 10-pixel jumps
+        self.bind_all("<Shift-Up>", lambda e: self._on_keyboard_nudge(0, -10, e))
+        self.bind_all("<Shift-Down>", lambda e: self._on_keyboard_nudge(0, 10, e))
+        self.bind_all("<Shift-Left>", lambda e: self._on_keyboard_nudge(-10, 0, e))
+        self.bind_all("<Shift-Right>", lambda e: self._on_keyboard_nudge(10, 0, e))
+ 
     def _build_top_controls(self):
         self.input_frame = tk.Frame(self, bg="#f0f0f0")
         self.input_frame.pack(side="top", fill="x", pady=5)
 
         # Packed from the right in order:
-        # [Export Image] [Export All] [Autosize] [Exit]
+        # [Fullscreen] [Show BBoxes] [Export Image] [Export All] [Fit to Window] [Exit]
 
         # 1. Exit Button (rightmost)
         self.exit_btn = tk.Button(
@@ -568,24 +999,24 @@ class LiveEditor(tk.Frame):
         )
         self.exit_btn.pack(side="right", padx=(5, 15))
 
-        # 2. Autosize to Window (to the left of Exit)
-        self.autosize_enabled = tk.BooleanVar(value=False)
-        self.autosize_toggle = tk.Checkbutton(
+        # 2. Fit to Window Button
+        self.fit_window_btn = tk.Button(
             self.input_frame,
-            text="🔄 Autosize to Window",
-            font=("Arial", 11),
-            bg="#f0f0f0",
+            text="Fit to Window",
+            font=("Arial", 10, "bold"),
+            bg="#d9d9d9",
             fg="black",
+            activebackground="#bfbfbf",
             activeforeground="black",
-            selectcolor="#ffffff",
-            anchor="w",
-            justify="left",
-            variable=self.autosize_enabled,
-            command=self._on_autosize_toggle_click
+            relief="raised",
+            bd=2,
+            padx=10,
+            pady=2,
+            command=self.trigger_fit_to_window
         )
-        self.autosize_toggle.pack(side="right", padx=10)
+        self.fit_window_btn.pack(side="right", padx=10)
 
-        # 3. Export All Button (between Export Image and Autosize)
+        # 3. Export All Button
         self.export_all_btn = tk.Button(
             self.input_frame,
             text="Export All",
@@ -603,7 +1034,7 @@ class LiveEditor(tk.Frame):
         )
         self.export_all_btn.pack(side="right", padx=5)
 
-        # 4. Export Image Button (to the left of Export All)
+        # 4. Export Image Button
         self.export_img_btn = tk.Button(
             self.input_frame,
             text="Export Image",
@@ -621,10 +1052,216 @@ class LiveEditor(tk.Frame):
         )
         self.export_img_btn.pack(side="right", padx=5)
 
+        # 5. Show BBoxes Button
+        self.show_bboxes_btn = tk.Button(
+            self.input_frame,
+            text="Show BBoxes",
+            font=("Arial", 10, "bold"),
+            bg="#d9d9d9",
+            fg="black",
+            activebackground="#bfbfbf",
+            activeforeground="black",
+            relief="raised",
+            bd=2,
+            padx=10,
+            pady=2,
+            command=self.toggle_bounding_boxes
+        )
+        self.show_bboxes_btn.pack(side="right", padx=5)
+
+        # 6. Fullscreen Button (Newly engineered presentation modifier)
+        self.fullscreen_btn = tk.Button(
+            self.input_frame,
+            text="Fullscreen",
+            font=("Arial", 10, "bold"),
+            bg="#d9d9d9",
+            fg="black",
+            activebackground="#bfbfbf",
+            activeforeground="black",
+            relief="raised",
+            bd=2,
+            padx=10,
+            pady=2,
+            command=self.toggle_fullscreen_mode
+        )
+        self.fullscreen_btn.pack(side="right", padx=5)
+
+    def render_zoomed_view(self, image_scaler = Image.Resampling.BILINEAR):
+        """
+        Dynamically applies PIL rescaling across the active background 
+        and text overlays relative to the current zoom_scale factor.
+        Centering calculation is built directly into placement geometry.
+        """
+        if self.current_img_index == -1 or not self.current_bg_pil:
+            return
+
+        data_bundle = self.gallery_images[self.current_img_index]
+        w, h = self.current_bg_pil.size
+        
+        # Calculate fresh scaled spatial dimensions
+        scaled_w = max(1, int(w * self.zoom_scale))
+        scaled_h = max(1, int(h * self.zoom_scale))
+
+        # 1. Clear out active layers
+        self.canvas.delete("all")
+        self._tk_overlay_cache.clear()
+        self.layer_image_refs.clear()
+        
+        # 2. Force layout updates to read correct container bounds
+        self.update_idletasks()
+        view_w = self.canvas_container.winfo_width()
+        view_h = self.canvas_container.winfo_height()
+        if view_w <= 1: view_w = 1280
+        if view_h <= 1: view_h = 720
+
+        # 3. Dynamic Padding Offsets: If image is smaller than window, center it inside the canvas.
+        # If it is larger, place it at 0,0 and let the scrollbars handle it.
+        offset_x = max(0, (view_w - scaled_w) // 2)
+        offset_y = max(0, (view_h - scaled_h) // 2)
+
+        # 4. Rescale and draw the main background image canvas block
+        zoomed_bg_pil = self.current_bg_pil.resize((scaled_w, scaled_h), image_scaler)
+        self.tk_bg_image = ImageTk.PhotoImage(zoomed_bg_pil)
+        self.canvas.create_image(offset_x, offset_y, image=self.tk_bg_image, anchor="nw", tags="bg_layer")
+        
+        # Configure navigation scroll barriers to map the absolute visible boundaries flawlessly
+        scroll_w = max(scaled_w, view_w)
+        scroll_h = max(scaled_h, view_h)
+        self.canvas.config(scrollregion=(0, 0, scroll_w, scroll_h))
+
+        # 5. Pull text overlays and position them relative to the dynamic offsets
+        layers = data_bundle.get("layers", [])
+        coords = data_bundle.get("coords", [])
+
+        for i, pil_layer in enumerate(layers):
+            if not isinstance(pil_layer, Image.Image):
+                continue
+            try:
+                l_w, l_h = pil_layer.size
+                new_l_w = max(1, int(l_w * self.zoom_scale))
+                new_l_h = max(1, int(l_h * self.zoom_scale))
+                
+                scaled_layer_pil = pil_layer.resize((new_l_w, new_l_h), Image.Resampling.BILINEAR)
+                tk_layer_img = ImageTk.PhotoImage(scaled_layer_pil)
+                self._tk_overlay_cache.append(tk_layer_img)
+
+                # Project coordinate positions out with the dynamic centering offset included
+                orig_x, orig_y = coords[i] if i < len(coords) else (50, 50)
+                translated_x = int(orig_x * self.zoom_scale) + offset_x
+                translated_y = int(orig_y * self.zoom_scale) + offset_y
+
+                layer_tag = f"layer_idx_{i}"
+                layer_id = self.canvas.create_image(
+                    translated_x, translated_y, image=tk_layer_img, anchor="nw", tags=("draggable_layer", layer_tag)
+                )
+
+                self.layer_image_refs[layer_id] = tk_layer_img
+                
+                self.canvas.tag_bind(layer_id, "<ButtonPress-1>", lambda event, lid=layer_id, lidx=i: self._on_drag_start(event, lid, lidx))
+                self.canvas.tag_bind(layer_id, "<B1-Motion>", self._on_dragging)
+                self.canvas.tag_bind(layer_id, "<ButtonRelease-1>", lambda event, lid=layer_id, lidx=i: self._on_drag_end(event, lid, lidx))
+            except Exception as e:
+                print(f"Error scaling overlay item {i}: {e}")
+                # Rerender wireframe tracking layer if active
+
+        self.draw_inline_bounding_boxes()
+
+    def toggle_bounding_boxes(self):
+        """Toggles the inline canvas layer bounding rectangles visibility state."""
+        self.show_bboxes_active = not self.show_bboxes_active
+        
+        if self.show_bboxes_active:
+            self.show_bboxes_btn.config(bg="#a5d6a7", activebackground="#81c784") # Green highlight when active
+            self.draw_inline_bounding_boxes()
+        else:
+            self.show_bboxes_btn.config(bg="#d9d9d9", activebackground="#bfbfbf")
+            self.canvas.delete("inline_bbox_rect")
+    
+    def toggle_fullscreen_mode(self):
+        """Toggles window fullscreen mode via pure OS presentation layout abstractions."""
+        top_level = self.winfo_toplevel()
+        self.is_fullscreen = not self.is_fullscreen
+        
+        if self.is_fullscreen:
+            # Shift button styling to showcase state change
+            self.fullscreen_btn.config(bg="#a5d6a7", activebackground="#81c784")
+            
+            # Cross-platform window expansion protocol
+            top_level.attributes("-fullscreen", True)
+        else:
+            self.fullscreen_btn.config(bg="#d9d9d9", activebackground="#bfbfbf")
+            top_level.attributes("-fullscreen", False)
+            
+            # Recalculate dimensions to return to normal size constraints smoothly
+            if self.current_img_index != -1 and self.gallery_images:
+                self.load_background_image_by_index(self.current_img_index)
+                
+        # Proactively re-center viewport layouts matching the changes
+        self.master.after(150, self.trigger_fit_to_window)
+
+    def draw_inline_bounding_boxes(self):
+        """Calculates scale variations dynamically to project red wireframes or solid green selected outlines."""
+        self.canvas.delete("inline_bbox_rect")
+        if not self.show_bboxes_active or self.current_img_index == -1 or not self.current_bg_pil:
+            return
+
+        data_bundle = self.gallery_images[self.current_img_index]
+        layers = data_bundle.get("layers", [])
+        coords = data_bundle.get("coords", [])
+
+        view_w = self.canvas_container.winfo_width()
+        view_h = self.canvas_container.winfo_height()
+        if view_w <= 1: view_w = 1280
+        if view_h <= 1: view_h = 720
+
+        scaled_w = max(1, int(self.bg_width * self.zoom_scale))
+        scaled_h = max(1, int(self.bg_height * self.zoom_scale))
+
+        offset_x = max(0, (view_w - scaled_w) // 2)
+        offset_y = max(0, (view_h - scaled_h) // 2)
+
+        for i, pil_layer in enumerate(layers):
+            if not isinstance(pil_layer, Image.Image):
+                continue
+            
+            orig_x, orig_y = coords[i] if i < len(coords) else (50, 50)
+            l_w, l_h = pil_layer.size
+
+            x1 = int(orig_x * self.zoom_scale) + offset_x
+            y1 = int(orig_y * self.zoom_scale) + offset_y
+            x2 = x1 + max(1, int(l_w * self.zoom_scale))
+            y2 = y1 + max(1, int(l_h * self.zoom_scale))
+
+            # Check if this item matches the active workspace modification index pointer
+            is_selected = (self.active_layer_index is not None and i == self.active_layer_index)
+
+            if is_selected:
+                # Selected layers get a solid, thick emerald green outline
+                self.canvas.create_rectangle(
+                    x1, y1, x2, y2,
+                    outline="#00E676",
+                    width=3,
+                    tags="inline_bbox_rect"
+                )
+            else:
+                # Unselected layers get a dashed red wireframe
+                self.canvas.create_rectangle(
+                    x1, y1, x2, y2,
+                    outline="red",
+                    width=2,
+                    dash=(4, 4),
+                    tags="inline_bbox_rect"
+                )
+            
+        self.canvas.tag_raise("inline_bbox_rect", "bg_layer")
+
     def exit_program(self):
         """Cleanly releases graphics/memory resources and terminates the program entirely."""
         try:
             self.on_close_cleanup()
+            shutdown_event.set()
+            subprocess.run(["killall" , "python"])
+            os.exit(0)
         except Exception:
             pass
         finally:
@@ -685,27 +1322,33 @@ class LiveEditor(tk.Frame):
         self.canvas.delete("all")
         self.canvas.config(scrollregion=(0, 0, 500, 400))
         self.canvas.create_text(
-            250, 200,
-            text="No images loaded.\n\nPlease append images to start editing.",
+            1280/2, 720/2,
+            text="No images loaded.\n\nRunning as server...",
             fill="white", font=("Arial", 12, "italic"), justify="center", tags="placeholder"
         )
 
-    def append_image(self, image_dict: dict, path: str = ""):
-        for r in image_dict['text_regions']:
-            print(f"FONT_SIZE: {r.font_size}")
+    def append_image(self, image_dict: dict, path: str = "", config: Config = None):
+        #Image.fromarray(image_dict['img_inpainted']).show()
+        self.config = config
+
+        rendered_text_list, rendered_text_coords = [],[]
+        
         rendered_text_list, rendered_text_coords = render_textblock_list_eng_rendered(
             img=image_dict['img_inpainted'],
             text_regions=image_dict['text_regions'],
-            rendered_text_list=[],
-            rendered_text_coords=[],
             original_img=image_dict['img_rgb'],
         )
-
+        
+        """rendered_text_list, rendered_text_coords = render_textblock_list_ch_rendered(
+            img=image_dict['img_inpainted'],
+            text_regions=image_dict['text_regions']
+        )"""
+        
         rendered_text_translated = [
             " ".join(seg_eng(r.translation)) for r in image_dict['text_regions']
         ]
         gallery_image = Image.fromarray(image_dict['img_inpainted'])
-
+   
         if not isinstance(gallery_image, Image.Image):
             return
 
@@ -720,7 +1363,7 @@ class LiveEditor(tk.Frame):
                 path,
             ),
             daemon=True,
-        ).start()
+        ).start() 
 
     def _async_gallery_worker(
         self,
@@ -752,9 +1395,6 @@ class LiveEditor(tk.Frame):
         except Exception as e:
             print(f"Background processing error: {e}")
 
-    # -------------------------------------------------------------
-    # Image Composition and Export Pipeline
-    # -------------------------------------------------------------
     def _composite_bundle(self, bundle: dict) -> Optional[Image.Image]:
         bg_pil = bundle.get("bg")
         if bg_pil is None:
@@ -795,8 +1435,6 @@ class LiveEditor(tk.Frame):
             return False
 
     def export_current_image(self):
-        if self.autosize_enabled.get():
-            return
         if self.current_img_index == -1 or not self.gallery_images:
             return
 
@@ -815,8 +1453,6 @@ class LiveEditor(tk.Frame):
             self._save_composition(bundle, export_path)
 
     def export_all_images(self):
-        if self.autosize_enabled.get():
-            return
         if not self.gallery_images:
             return
 
@@ -831,9 +1467,17 @@ class LiveEditor(tk.Frame):
 
         print(f"Batch export completed: {success_count}/{len(self.gallery_images)} image(s) saved.")
 
-    # -------------------------------------------------------------
-    # Closable Property Box Management
-    # -------------------------------------------------------------
+    def _on_property_box_configure(self, event):
+        """Monitors property box position updates to persist custom positions in memory."""
+        if self.property_box and self.property_box.winfo_exists():
+            # Grab real-time relative pixel window position markers
+            x = self.property_box.winfo_x()
+            y = self.property_box.winfo_y()
+            
+            # Avoid logging initialization state flags or minimized viewport artifact values
+            if x > -2000 and y > -2000:
+                self._saved_property_box_geometry = (x, y)
+
     def open_or_update_property_box(self, layer_index: int, event=None):
         active_bundle = self.gallery_images[self.current_img_index] if self.current_img_index != -1 else {}
         text_strings = active_bundle.get("text_strings", [])
@@ -849,28 +1493,33 @@ class LiveEditor(tk.Frame):
         if (current_fg is None or current_bg is None) and hasattr(region, 'get_font_colors'):
             try:
                 def_fg, def_bg = region.get_font_colors()
-                if current_fg is None:
-                    current_fg = def_fg
-                if current_bg is None:
-                    current_bg = def_bg
+                if current_fg is None: current_fg = def_fg
+                if current_bg is None: current_bg = def_bg
             except Exception:
                 pass
 
-        if current_fg is None:
-            current_fg = (0, 0, 0)
-        else:
-            current_fg = tuple(int(c) for c in current_fg[:3])
+        if current_fg is None: current_fg = (0, 0, 0)
+        if current_bg is None: current_bg = (255, 255, 255)
 
-        if current_bg is None:
-            current_bg = (255, 255, 255)
-        else:
-            current_bg = tuple(int(c) for c in current_bg[:3])
+        if region:
+            if not hasattr(region, 'fg_colors') or region.fg_colors is None:
+                region.fg_colors = np.array(current_fg, dtype=np.uint8)
+            if not hasattr(region, 'bg_colors') or region.bg_colors is None:
+                region.bg_colors = np.array(current_bg, dtype=np.uint8)
 
-        self.current_fg_color = current_fg
-        self.current_bg_color = current_bg
+        fg = region.fg_colors
+        bg = region.bg_colors
+        fg_flat = np.ravel(fg)
+        bg_flat = np.ravel(bg)
 
-        fg_hex = f"#{current_fg[0]:02x}{current_fg[1]:02x}{current_fg[2]:02x}"
-        bg_hex = f"#{current_bg[0]:02x}{current_bg[1]:02x}{current_bg[2]:02x}"
+        fg_tuple = tuple(int(c) for c in fg_flat[:3])
+        bg_tuple = tuple(int(c) for c in bg_flat[:3])
+
+        self.current_fg_color = fg_tuple
+        self.current_bg_color = bg_tuple
+
+        fg_hex = f"#{fg_tuple[0]:02x}{fg_tuple[1]:02x}{fg_tuple[2]:02x}"
+        bg_hex = f"#{bg_tuple[0]:02x}{bg_tuple[1]:02x}{bg_tuple[2]:02x}"
 
         if self.property_box is None or not self.property_box.winfo_exists():
             self.property_box = tk.Toplevel(self)
@@ -879,96 +1528,101 @@ class LiveEditor(tk.Frame):
             self.property_box.protocol("WM_DELETE_WINDOW", self.close_property_box)
             self.property_box.config(bg="#f4f4f4")
 
-            if event is not None:
-                x = event.x_root + 15
-                y = event.y_root + 15
-                self.property_box.geometry(f"+{x}+{y}")
+            self.property_box.bind("<FocusIn>", lambda e: setattr(self, 'property_box_has_focus', True))
+            self.property_box.bind("<FocusOut>", lambda e: setattr(self, 'property_box_has_focus', False))
+            
+            # Track whenever the window gets moved or resized to capture its placement coordinate string
+            self.property_box.bind("<Configure>", self._on_property_box_configure)
 
-            content = tk.Frame(self.property_box, bg="#f4f4f4", padx=14, pady=12)
+            prop_w = 340
+            prop_h = 240
+
+            # Restore user's custom location if it was previously saved
+            if self._saved_property_box_geometry:
+                self.property_box.geometry(f"{prop_w}x{prop_h}+{self._saved_property_box_geometry[0]}+{self._saved_property_box_geometry[1]}")
+            else:
+                # Default position: dock cleanly to the top-right corner of the parent application window
+                screen_w = self.winfo_screenwidth()
+                screen_h = self.winfo_screenheight()
+
+                main_win = self.winfo_toplevel()
+                main_win.update_idletasks()
+                main_x = main_win.winfo_x()
+                main_y = main_win.winfo_y()
+                main_w = main_win.winfo_width()
+
+                target_x = main_x + main_w - prop_w - 20
+                target_y = main_y + 60
+
+                if target_x + prop_w > screen_w: target_x = screen_w - prop_w - 10
+                if target_y + prop_h > screen_h: target_y = screen_h - prop_h - 40
+                if target_x < 0: target_x = 10
+                if target_y < 0: target_y = 10
+
+                self.property_box.geometry(f"{prop_w}x{prop_h}+{target_x}+{target_y}")
+
+            content = tk.Frame(self.property_box, bg="#f4f4f4", padx=10, pady=8)
             content.pack(fill="both", expand=True)
 
-            # 1. Font Size
+            # 1. Font Size Row Layout
             size_frame = tk.Frame(content, bg="#f4f4f4")
-            size_frame.pack(fill="x", pady=(0, 6))
-            tk.Label(size_frame, text="Font Size:", font=("Arial", 10, "bold"), bg="#f4f4f4", width=12, anchor="w").pack(side="left")
-            self.layer_font_size_display = tk.Entry(size_frame, font=("Arial", 10), width=10, bg="#ffffff", fg="#000000")
-            self.layer_font_size_display.pack(side="left", padx=5)
+            size_frame.pack(fill="x", pady=(0, 4))
+            tk.Label(size_frame, text="Font Size:", font=("Arial", 9, "bold"), bg="#f4f4f4", width=10, anchor="w").pack(side="left")
+            self.layer_font_size_display = tk.Entry(size_frame, font=("Arial", 9), width=8, bg="#ffffff", fg="#000000")
+            self.layer_font_size_display.pack(side="left", padx=2)
             self.layer_font_size_display.bind("<KeyRelease>", self._on_layer_font_size_modified)
 
-            # 2. Font Color (FG)
+            # 2. Font Color Row Layout
             fg_frame = tk.Frame(content, bg="#f4f4f4")
-            fg_frame.pack(fill="x", pady=(0, 6))
-            tk.Label(fg_frame, text="Font Color:", font=("Arial", 10, "bold"), bg="#f4f4f4", width=12, anchor="w").pack(side="left")
-
-            self.fg_color_swatch = tk.Label(fg_frame, width=5, height=1, relief="solid", bd=1, bg=fg_hex)
-            self.fg_color_swatch.pack(side="left", padx=(5, 6))
-
-            self.fg_color_pick_btn = tk.Button(
-                fg_frame,
-                text="🎨 Choose...",
-                font=("Arial", 9),
-                command=self._on_choose_fg_color
-            )
+            fg_frame.pack(fill="x", pady=(0, 4))
+            tk.Label(fg_frame, text="Font Color:", font=("Arial", 9, "bold"), bg="#f4f4f4", width=10, anchor="w").pack(side="left")
+            self.fg_color_swatch = tk.Label(fg_frame, width=4, height=1, relief="solid", bd=1, bg=fg_hex)
+            self.fg_color_swatch.pack(side="left", padx=(2, 4))
+            self.fg_color_pick_btn = tk.Button(fg_frame, text="🎨 Choose...", font=("Arial", 8), command=self._on_choose_fg_color)
             self.fg_color_pick_btn.pack(side="left")
 
-            # 3. Background Color (BG / Stroke)
+            # 3. Background Color Row Layout
             bg_frame = tk.Frame(content, bg="#f4f4f4")
-            bg_frame.pack(fill="x", pady=(0, 6))
-            tk.Label(bg_frame, text="BG Color:", font=("Arial", 10, "bold"), bg="#f4f4f4", width=12, anchor="w").pack(side="left")
-
-            self.bg_color_swatch = tk.Label(bg_frame, width=5, height=1, relief="solid", bd=1, bg=bg_hex)
-            self.bg_color_swatch.pack(side="left", padx=(5, 6))
-
-            self.bg_color_pick_btn = tk.Button(
-                bg_frame,
-                text="🎨 Choose...",
-                font=("Arial", 9),
-                command=self._on_choose_bg_color
-            )
+            bg_frame.pack(fill="x", pady=(0, 4))
+            tk.Label(bg_frame, text="BG Color:", font=("Arial", 9, "bold"), bg="#f4f4f4", width=10, anchor="w").pack(side="left")
+            self.bg_color_swatch = tk.Label(bg_frame, width=4, height=1, relief="solid", bd=1, bg=bg_hex)
+            self.bg_color_swatch.pack(side="left", padx=(2, 4))
+            self.bg_color_pick_btn = tk.Button(bg_frame, text="🎨 Choose...", font=("Arial", 8), command=self._on_choose_bg_color)
             self.bg_color_pick_btn.pack(side="left")
 
-            # 4. Layer Text
+            # 4. Font Face Dropdown Layout
+            font_frame = tk.Frame(content, bg="#f4f4f4")
+            font_frame.pack(fill="x", pady=(0, 4))
+            tk.Label(font_frame, text="Font Face:", font=("Arial", 9, "bold"), bg="#f4f4f4", width=10, anchor="w").pack(side="left")
+            self.available_fonts_dict = get_system_and_fallback_fonts()
+            font_display_names = sorted(list(self.available_fonts_dict.keys()))
+            self.layer_font_combobox = ttk.Combobox(font_frame, values=font_display_names, font=("Arial", 8), state="readonly")
+            self.layer_font_combobox.pack(side="left", padx=2, fill="x", expand=True)
+            self.layer_font_combobox.bind("<<ComboboxSelected>>", self._on_property_font_dropdown_changed)
+
+            # 5. Text Input Row Layout
             text_frame = tk.Frame(content, bg="#f4f4f4")
-            text_frame.pack(fill="x", pady=(0, 10))
-            tk.Label(text_frame, text="Layer Text:", font=("Arial", 10, "bold"), bg="#f4f4f4", width=12, anchor="w").pack(side="left")
-            self.layer_text_display = tk.Entry(text_frame, font=("Arial", 10), width=32, bg="#ffffff", fg="#000000")
-            self.layer_text_display.pack(side="left", padx=5, fill="x", expand=True)
+            text_frame.pack(fill="x", pady=(0, 8))
+            tk.Label(text_frame, text="Layer Text:", font=("Arial", 9, "bold"), bg="#f4f4f4", width=10, anchor="w").pack(side="left")
+            self.layer_text_display = tk.Entry(text_frame, font=("Arial", 9), bg="#ffffff", fg="#000000")
+            self.layer_text_display.pack(side="left", padx=2, fill="x", expand=True)
             self.layer_text_display.bind("<KeyRelease>", self._on_layer_text_modified)
 
-            # 5. Buttons (Render and Close)
+            # 6. Action Control Footer Buttons
             btn_frame = tk.Frame(content, bg="#f4f4f4")
-            btn_frame.pack(fill="x", pady=(4, 0))
+            btn_frame.pack(fill="x", side="bottom", pady=(2, 0))
 
             self.render_btn = tk.Button(
-                btn_frame,
-                text="Render Text",
-                font=("Arial", 10, "bold"),
-                bg="#2e7d32",
-                fg="#ffffff",
-                activebackground="#1b5e20",
-                activeforeground="#ffffff",
-                padx=12,
-                pady=4,
-                relief="raised",
-                bd=2,
-                cursor="hand2",
+                btn_frame, text="Render Text", font=("Arial", 9, "bold"), bg="#2e7d32", fg="#ffffff",
+                activebackground="#1b5e20", activeforeground="#ffffff", padx=10, pady=2, relief="raised", bd=2, cursor="hand2",
                 command=self._on_render_text_click
             )
-            self.render_btn.pack(side="left", padx=(0, 8))
+            self.render_btn.pack(side="left")
 
-            close_btn = tk.Button(
-                btn_frame,
-                text="Close",
-                font=("Arial", 10),
-                bg="#e0e0e0",
-                padx=8,
-                pady=4,
-                command=self.close_property_box
-            )
+            close_btn = tk.Button(btn_frame, text="Close", font=("Arial", 9), bg="#e0e0e0", padx=6, pady=2, command=self.close_property_box)
             close_btn.pack(side="right")
 
         self.property_box.title(f"Layer {layer_index + 1} Properties")
-
         self.layer_text_display.config(state="normal")
         self.layer_text_display.delete(0, tk.END)
         self.layer_text_display.insert(0, display_text)
@@ -977,21 +1631,25 @@ class LiveEditor(tk.Frame):
         self.layer_font_size_display.delete(0, tk.END)
         self.layer_font_size_display.insert(0, font_size)
 
+        current_selection = self.layer_font_combobox.get()
+        if not current_selection and hasattr(self, 'available_fonts_dict'):
+            font_names = sorted(list(self.available_fonts_dict.keys()))
+            anime_ace_match = [n for n in font_names if "anime_ace" in n.lower()]
+            if anime_ace_match:
+                self.layer_font_combobox.set(anime_ace_match[0])
+            elif font_names:
+                self.layer_font_combobox.current(0)
+
         self.fg_color_swatch.config(bg=fg_hex)
         self.bg_color_swatch.config(bg=bg_hex)
-
-        if self.autosize_enabled.get():
-            self.layer_text_display.config(state="disabled")
-            self.layer_font_size_display.config(state="disabled")
-            self.fg_color_pick_btn.config(state="disabled")
-            self.bg_color_pick_btn.config(state="disabled")
-        else:
-            self.fg_color_pick_btn.config(state="normal")
-            self.bg_color_pick_btn.config(state="normal")
-
         self.property_box.lift()
+        
+        self.draw_inline_bounding_boxes()
 
     def close_property_box(self):
+        self.property_box_has_focus = False  # Ensure input protection releases safely
+        self.active_layer_index = None       # Reset active element tracking
+        
         if self.property_box is not None:
             if self.property_box.winfo_exists():
                 self.property_box.destroy()
@@ -1003,6 +1661,50 @@ class LiveEditor(tk.Frame):
             self.bg_color_pick_btn = None
             self.layer_text_display = None
             self.render_btn = None
+            
+        # Clear out target selections formatting right away
+        self.draw_inline_bounding_boxes()
+
+    def _on_keyboard_nudge(self, dx: int, dy: int, event=None):
+        """
+        Micro-adjusts the selected text layer coordinate position via arrow keys.
+        Safely aborts calculations if a text property input field is currently active.
+        """
+        # 1. Defensively exit if property box has input focus, or no layer is selected
+        if self.property_box_has_focus or self.active_layer_id is None or self.active_layer_index is None:
+            return
+
+        if self.current_img_index == -1:
+            return
+
+        # 2. Translate the visual element layer directly on the Tkinter canvas space
+        self.canvas.move(self.active_layer_id, dx, dy)
+
+        # 3. Pull the updated visual position and sync back to the master native coordinate dataset
+        current_coords = self.canvas.coords(self.active_layer_id)
+        if current_coords:
+            active_bundle = self.gallery_images[self.current_img_index]
+            coords = active_bundle.setdefault("coords", [])
+            
+            view_w = self.canvas_container.winfo_width()
+            view_h = self.canvas_container.winfo_height()
+            if view_w <= 1: view_w = 1280
+            if view_h <= 1: view_h = 720
+
+            scaled_w = int(self.bg_width * self.zoom_scale)
+            scaled_h = int(self.bg_height * self.zoom_scale)
+            
+            offset_x = max(0, (view_w - scaled_w) // 2)
+            offset_y = max(0, (view_h - scaled_h) // 2)
+                
+            native_x = int(round((current_coords[0] - offset_x) / self.zoom_scale))
+            native_y = int(round((current_coords[1] - offset_y) / self.zoom_scale))
+            
+            if self.active_layer_index < len(coords):
+                coords[self.active_layer_index] = (native_x, native_y)
+
+        # 4. Instantly refresh the wireframe outline location matching your shift coordinates
+        self.draw_inline_bounding_boxes()
 
     def _on_choose_fg_color(self):
         if self.current_img_index == -1 or self.active_layer_index is None:
@@ -1011,11 +1713,7 @@ class LiveEditor(tk.Frame):
         init_hex = f"#{self.current_fg_color[0]:02x}{self.current_fg_color[1]:02x}{self.current_fg_color[2]:02x}"
         parent_win = self.property_box if (self.property_box and self.property_box.winfo_exists()) else self
 
-        chosen = colorchooser.askcolor(
-            color=init_hex,
-            title="Choose Font Color",
-            parent=parent_win
-        )
+        chosen = colorchooser.askcolor(color=init_hex, title="Choose Font Color", parent=parent_win)
 
         if chosen and chosen[0] is not None:
             rgb = tuple(int(round(c)) for c in chosen[0])
@@ -1028,8 +1726,14 @@ class LiveEditor(tk.Frame):
             active_bundle = self.gallery_images[self.current_img_index]
             text_regions = active_bundle.get("text_regions", [])
             if self.active_layer_index < len(text_regions):
-                text_regions[self.active_layer_index].fg_color = rgb
-                text_regions[self.active_layer_index].font_color = rgb
+                reg = text_regions[self.active_layer_index]
+                # Enforce total synchronization across metadata namespaces
+                color_arr = np.array(rgb, dtype=np.uint8)
+                reg.fg_color = rgb
+                reg.font_color = rgb
+                reg.fg_colors = color_arr
+                if hasattr(reg, 'set_fg_colors'):
+                    reg.set_fg_colors(color_arr)
 
     def _on_choose_bg_color(self):
         if self.current_img_index == -1 or self.active_layer_index is None:
@@ -1055,8 +1759,15 @@ class LiveEditor(tk.Frame):
             active_bundle = self.gallery_images[self.current_img_index]
             text_regions = active_bundle.get("text_regions", [])
             if self.active_layer_index < len(text_regions):
-                text_regions[self.active_layer_index].bg_color = rgb
-                text_regions[self.active_layer_index].stroke_color = rgb
+                reg = text_regions[self.active_layer_index]
+                color_arr = np.array(rgb, dtype=np.uint8)
+                # Sync standard Python metadata tuples
+                reg.bg_color = rgb
+                reg.stroke_color = rgb
+                reg.bg_colors = color_arr
+                # Sync underlying rendering engine NumPy matrix color definitions
+                if hasattr(reg, 'set_bg_colors'):
+                    reg.set_bg_colors(color_arr)
 
     def _on_layer_font_size_modified(self, event):
         if self.current_img_index == -1 or self.active_layer_index is None:
@@ -1091,16 +1802,19 @@ class LiveEditor(tk.Frame):
         text_strings[self.active_layer_index] = updated_text
 
     def _on_drag_start(self, event, target_id, layer_index):
-        self.open_or_update_property_box(layer_index, event)
-
-        if self.autosize_enabled.get():
+        if event.state & 0x0004:
             return
+
+        self.open_or_update_property_box(layer_index, event)
 
         self.active_layer_id = target_id
         self.active_layer_index = layer_index
         self.canvas.itemconfig(target_id, state="normal")
-        self.drag_data["x"] = self.canvas.canvasx(event.x)
-        self.drag_data["y"] = self.canvas.canvasy(event.y)
+        
+        self.drag_data["x"] = event.x
+        self.drag_data["y"] = event.y
+        
+        return "break"  # Prevents event bubbling into the background canvas layer
 
     def _on_render_text_click(self):
         if self.current_img_index == -1:
@@ -1118,22 +1832,16 @@ class LiveEditor(tk.Frame):
         for i, region in enumerate(text_regions):
             if i < len(text_strings):
                 region.translation = text_strings[i]
-
-        if self.active_layer_index is not None and self.active_layer_index < len(text_regions):
-            text_regions[self.active_layer_index].fg_color = self.current_fg_color
-            text_regions[self.active_layer_index].font_color = self.current_fg_color
-            text_regions[self.active_layer_index].bg_color = self.current_bg_color
-            text_regions[self.active_layer_index].stroke_color = self.current_bg_color
-
+            
+        target_text_region = text_regions[self.active_layer_index]
         try:
-            #set_font(os.path.join(BASE_PATH, 'fonts/msyh.ttc'))
-
+            saved_coords = active_bundle["coords"][self.active_layer_index]
             new_rendered_layers, new_coords = render_textblock_list_eng_rendered(
                 img=img_inpainted,
-                text_regions=[text_regions[self.active_layer_index],], #text_regions,
-                rendered_text_list=[],
-                rendered_text_coords=[],
+                text_regions=[target_text_region,], 
                 original_img=original_img_rgb,
+                font_path=self.current_font_path,
+                force_font_size=target_text_region.font_size
             )
 
             processed_layers = [
@@ -1142,42 +1850,83 @@ class LiveEditor(tk.Frame):
             ]
 
             active_bundle["layers"][self.active_layer_index] = processed_layers[0]
-            active_bundle["coords"][self.active_layer_index] = (new_coords[0][0], new_coords[0][1])
-            #active_bundle["layers"] = processed_layers
-            #active_bundle["coords"] = [(c[0], c[1]) for c in new_coords]
+            active_bundle["coords"][self.active_layer_index] = saved_coords #(new_coords[0][0], new_coords[0][1])
 
-            if self.autosize_enabled.get():
-                self.fit_background_to_window()
-            else:
-                self.load_background_image_by_index(self.current_img_index)
+            self.load_background_image_by_index(self.current_img_index)
         except Exception as e:
             print(f"Error during on-demand text layer rendering: {e}")
 
     def _safe_append_thumbnail(self, data_bundle, thumb_tk):
-        self.thumbnail_refs.append(thumb_tk)
-        self.gallery_images.append(data_bundle)
-        assigned_index = len(self.gallery_images) - 1
+        """
+        Inserts incoming page frames alphanumerically by their export_path filename
+        and cleanly updates the Tkinter gallery widget order.
+        """
+        # 1. Track the true target path identifier for this incoming file
+        target_path = data_bundle.get("export_path", "") or data_bundle.get("dest", "")
+        
+        # 2. Extract an ordered alphanumeric tracking list of paths currently in our gallery
+        existing_paths = [
+            b.get("export_path", "") or b.get("dest", "") 
+            for b in self.gallery_images
+        ]
+        
+        # 3. Use bisect to discover the exact alphanumeric index insertion point
+        # We wrap the evaluation inside our natural sort key to ensure '2' comes before '10'
+        sorted_keys = [natural_sort_key(p) for p in existing_paths]
+        target_key = natural_sort_key(target_path)
+        
+        assigned_index = bisect.bisect_left(sorted_keys, target_key)
+        
+        # 4. Slide the new asset metrics directly into the mapped array index slot
+        self.gallery_images.insert(assigned_index, data_bundle)
+        self.thumbnail_refs.insert(assigned_index, thumb_tk)
+        
+        # 5. Redraw the sidebar gallery grid completely to reflect the true sorting order
+        self._rebuild_sidebar_gallery_widgets()
 
-        btn = tk.Button(
-            self.scrollable_gallery_frame,
-            image=thumb_tk,
-            command=lambda idx=assigned_index: self.load_background_image_by_index(idx),
-            bd=2,
-            relief="groove"
-        )
-        btn.pack(pady=8, padx=10)
-
+        # If this is the first image entering the session pool, boot the canvas view right away
         if len(self.gallery_images) == 1:
             self.load_background_image_by_index(0)
+        else:
+            # If the user is currently viewing a page that shifted position because a new 
+            # alphanumeric file sneaked in before it, update the current tracking pointer
+            if self.current_img_index != -1 and assigned_index <= self.current_img_index:
+                self.current_img_index += 1
+
+    def _rebuild_sidebar_gallery_widgets(self):
+        """Wipes and systematically repacks sidebar thumb buttons in sorted order."""
+        # Clear any active button widgets packed inside the sidebar frame container
+        for widget in self.scrollable_gallery_frame.winfo_children():
+            widget.destroy()
+            
+        # Re-instantiate buttons targeting their newly updated sorted indices
+        for idx, bundle in enumerate(self.gallery_images):
+            tk_thumb = self.thumbnail_refs[idx]
+            
+            btn = tk.Button(
+                self.scrollable_gallery_frame,
+                image=tk_thumb,
+                command=lambda current_idx=idx: self.load_background_image_by_index(current_idx),
+                bd=2,
+                relief="groove"
+            )
+            btn.pack(pady=8, padx=10)
 
     def load_background_image_by_index(self, target_index: int):
         if not self.gallery_images or not (0 <= target_index < len(self.gallery_images)):
             return
+
+        # Capture the current viewport position fractions before changing the image index
+        prev_x_view = self.canvas.xview() if hasattr(self, 'canvas') else (0.0, 1.0)
+        prev_y_view = self.canvas.yview() if hasattr(self, 'canvas') else (0.0, 1.0)
+        
         self.close_property_box()
         self.current_img_index = target_index
-        self.load_background_image(self.gallery_images[target_index])
+        
+        # Pass the viewport tracking state into the loader
+        self.load_background_image(self.gallery_images[target_index], prev_x_view[0], prev_y_view[0])
 
-    def load_background_image(self, data_bundle: dict):
+    def load_background_image(self, data_bundle: dict, restore_x: float = 0.0, restore_y: float = 0.0):
         pil_image = data_bundle["bg"]
         try:
             self.current_bg_pil = pil_image.copy()
@@ -1206,31 +1955,54 @@ class LiveEditor(tk.Frame):
                     pass
 
             top_level = self.winfo_toplevel()
-
-            if self.autosize_enabled.get():
-                self.canvas_container.pack_propagate(True)
-                final_width = min(target_width, screen_width) if screen_width > 0 else 1280
-                final_height = min(target_height, screen_height) if screen_height > 0 else 720
+            self.canvas_container.pack_propagate(True)
+            
+            # --- DEFENSIVE ENGINE: BLOCKS OVERRIDE AUTOMATIC FULLSCREEN BOOT ---
+            # Max dimensions are dynamically capped at 85% of display hardware configurations
+            max_safe_w = int(screen_width * 0.85) if screen_width > 0 else 1280
+            max_safe_h = int(screen_height * 0.85) if screen_height > 0 else 720
+            
+            final_width = min(target_width, max_safe_w)
+            final_height = min(target_height, max_safe_h)
+            
+            # Only apply regular bounds geometries changes if not intentionally toggled into Fullscreen
+            if not self.is_fullscreen:
                 top_level.geometry(f"{final_width}x{final_height}")
-                top_level.update_idletasks()
-                self.canvas_container.pack_propagate(False)
-                self.fit_background_to_window()
+            
+            # If zoom_scale is -1.0, this is the first boot initialization: trigger an auto-fit layout
+            if self.zoom_scale == -1.0:
+                view_h = final_height - 50
+                self.zoom_scale = max(0.15, view_h / self.bg_height)
+                should_center_fresh = True
             else:
-                self.canvas_container.pack_propagate(True)
-                self.tk_bg_image = ImageTk.PhotoImage(self.current_bg_pil)
-                final_width = min(target_width, int(screen_width * 0.75)) if screen_width > 0 else 1280
-                final_height = min(target_height, int(screen_height * 0.75)) if screen_height > 0 else 720
-                top_level.geometry(f"{final_width}x{final_height}")
+                should_center_fresh = False
+            
+            self.canvas.delete("all")
+            self.layer_image_refs.clear()
+            self.active_layer_id = None
+            
+            self.current_bg_pil = pil_image.copy()
+            self.bg_width, self.bg_height = self.current_bg_pil.size
+            
+            self.render_zoomed_view()
 
-                self.canvas.delete("all")
-                self.layer_image_refs.clear()
-                self.active_layer_id = None
-                self.canvas.config(scrollregion=(0, 0, self.bg_width, self.bg_height))
-                self.canvas.create_image(0, 0, image=self.tk_bg_image, anchor="nw", tags="bg_layer")
-                self.load_draggable_text_image_layers(data_bundle)
+            if should_center_fresh:
+                self.master.after(100, self.center_canvas_viewport)
+            else:
+                self.master.after(100, lambda: self._apply_viewport_scroll(restore_x, restore_y))
+
+            self.update_window_title_with_filename(data_bundle)
 
         except Exception as e:
             print(f"Error executing background transition: {e}")
+
+    def _apply_viewport_scroll(self, scroll_x: float, scroll_y: float):
+        """Restores explicit scroll fractions directly to the canvas axes."""
+        try:
+            self.canvas.xview_moveto(scroll_x)
+            self.canvas.yview_moveto(scroll_y)
+        except Exception:
+            pass
 
     def load_draggable_text_image_layers(self, data_bundle: dict):
         self._tk_overlay_cache.clear()
@@ -1259,37 +2031,23 @@ class LiveEditor(tk.Frame):
             except Exception as e:
                 print(f"Error rendering layer {i}: {e}")
 
-    def _on_drag_end(self, event, target_id, layer_index):
-        if self.autosize_enabled.get() or self.current_img_index == -1:
-            return
-
-        current_coords = self.canvas.coords(target_id)
-        if current_coords:
-            active_bundle = self.gallery_images[self.current_img_index]
-            coords = active_bundle.setdefault("coords", [])
-            while len(coords) <= layer_index:
-                coords.append((50, 50))
-            coords[layer_index] = (int(current_coords[0]), int(current_coords[1]))
-
-    def _on_autosize_toggle_click(self):
-        is_autosize = self.autosize_enabled.get()
-
-        btn_state = "disabled" if is_autosize else "normal"
-        self.export_img_btn.config(state=btn_state)
-        self.export_all_btn.config(state=btn_state)
-
-        if is_autosize:
-            self.canvas_container.pack_propagate(False)
-            self.fit_background_to_window()
-        else:
-            self.canvas_container.pack_propagate(True)
-            if self.current_img_index != -1:
-                self.load_background_image_by_index(self.current_img_index)
-
-    def _on_window_resize_event(self, event):
-        if self.autosize_enabled.get():
-            if abs(event.width - (self.bg_width + 4)) > 5 or abs(event.height - (self.bg_height + 4)) > 5:
-                self.fit_background_to_window()
+    def update_window_title_with_filename(self, data_bundle: dict):
+        """Extracts the base file name from the image metadata and updates the root window title."""
+        try:
+            # 1. Grab whatever path string identifier is available in the payload bundle
+            path_str = data_bundle.get("export_path", "") or data_bundle.get("dest", "")
+            
+            if path_str:
+                # 2. Extract just the file name (e.g., 'page_01.png' from '/path/to/page_01.png')
+                base_name = os.path.basename(os.path.normpath(str(path_str)))
+                new_title = f"Live Editor - {base_name}"
+            else:
+                new_title = f"Live Editor - Image {self.current_img_index + 1}"
+                
+            # 3. Apply the string directly to the root window top level title bar
+            self.winfo_toplevel().title(new_title)
+        except Exception as e:
+            print(f"Error updating window title: {e}", file=sys.stderr)
 
     def _on_arrow_left_press(self, event):
         if not self.gallery_images or self.current_img_index == -1:
@@ -1304,22 +2062,156 @@ class LiveEditor(tk.Frame):
         self.load_background_image_by_index(new_index)
 
     def _on_sidebar_mousewheel(self, event):
-        delta = -1 if (getattr(event, 'num', None) == 4 or getattr(event, 'delta', 0) > 0) else 1
+        # Base speed modifier for the sidebar layout
+        scroll_speed = 1
+        
+        if getattr(event, 'num', None) in (4, 5):
+            delta = -1 * scroll_speed if event.num == 4 else 1 * scroll_speed
+        else:
+            delta = -1 * scroll_speed if event.delta > 0 else 1 * scroll_speed
         self.gallery_canvas.yview_scroll(delta, "units")
 
     def _on_main_canvas_mousewheel(self, event):
-        delta = -1 if (getattr(event, 'num', None) == 4 or getattr(event, 'delta', 0) > 0) else 1
+        # ----------------------------------------------------
+        # SPEED TUNING PARAMETER
+        # ----------------------------------------------------
+        # Increase this number to scroll faster, decrease it to scroll slower.
+        scroll_speed = 1 
+
+        if getattr(event, 'num', None) in (4, 5):
+            delta = -1 * scroll_speed if event.num == 4 else 1 * scroll_speed
+        elif hasattr(event, 'delta') and event.delta != 0:
+            # Flatten Windows/macOS high-resolution delta counts down to base steps
+            base_step = int(event.delta / abs(event.delta)) # Yields a clean 1 or -1
+            delta = -1 * base_step * scroll_speed
+        else:
+            delta = -1 * scroll_speed if event.delta > 0 else 1 * scroll_speed
+
+        # Execute smooth, minor unit shifts along the active axis
         if (event.state & 0x1) != 0:
             self.canvas.xview_scroll(delta, "units")
         else:
             self.canvas.yview_scroll(delta, "units")
+
+    def _on_property_font_dropdown_changed(self, event=None):
+        """
+        Triggered dynamically whenever a user updates a font face option 
+        inside the open properties layout dialogue context window.
+        """
+        chosen_display_name = self.layer_font_combobox.get()
+        font_file_path = self.available_fonts_dict.get(chosen_display_name)
+
+        if font_file_path and os.path.exists(font_file_path):
+            print(f"[UI Layout Engine] Swapping typography selection to: '{font_file_path}'")
+            
+            # 1. Update the core FreeType font selections cache mapping list configurations 
+            # and flush the associated inner loop LRU glyph measurement caching dictionaries
+            text_render.set_font(font_file_path)
+            self.current_font_path = font_file_path
+            # 2. Re-trigger layout calculations across all currently indexed image blocks
+            '''if self.current_img_index != -1 and self.gallery_images:
+                active_bundle = self.gallery_images[self.current_img_index]
+                
+                # Fetch original source path matching this specific image block
+                path_string = active_bundle.get("export_path", "")
+                
+                # Re-invoke append_image to dynamically typeset all boxes on the active canvas viewport
+                self.append_image(active_bundle, path=path_string)'''
+
+    def scheduled_render(self):
+        self.current_bg_pil = self.gallery_images[self.current_img_index]["bg"].copy()
+        self.render_zoomed_view()
+
+    def schedule_render(self):
+        """
+        Debounces the high-quality BILINEAR render. 
+        Resets every time the user scrolls and fires 300ms after scrolling ends.
+        """
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+
+        # 300 milliseconds feels instantaneous to the user but groups scroll ticks perfectly
+        self.timer = threading.Timer(0.3, self.scheduled_render)
+        self.timer.start()
+        
+    def _on_ctrl_mousewheel_zoom(self, event):
+        """
+        Intercepts Control + Scroll events to handle smooth real-time image scaling.
+        Guarantees mouse focus points anchor accurately to prevent canvas drifting.
+        """
+        if self.current_img_index == -1:
+            return "break"
+
+        # 1. Trace the precise location on the image map directly underneath the cursor tip
+        mouse_canvas_x = self.canvas.canvasx(event.x)
+        mouse_canvas_y = self.canvas.canvasy(event.y)
+
+        # Convert canvas position coordinates down to 100% stable base pixel numbers
+        native_target_x = mouse_canvas_x / self.zoom_scale
+        native_target_y = mouse_canvas_y / self.zoom_scale
+
+        # 2. Determine mouse wheel rotation steps direction
+        if event.num == 4 or event.delta > 0:
+            zoom_factor = 1.03
+        else:
+            zoom_factor = 0.97
+            
+        proposed_scale = self.zoom_scale * zoom_factor
+
+        # Bound scaling limits defensively
+        if proposed_scale < self.min_zoom:
+            proposed_scale = self.min_zoom
+        elif proposed_scale > self.max_zoom:
+            proposed_scale = self.max_zoom
+
+        if proposed_scale == self.zoom_scale:
+            return "break"
+
+        # Apply updated scale configuration tracking metrics
+        self.zoom_scale = proposed_scale
+
+        # 3. Fire fast NEAREST resampling while the user is actively zooming
+        self.render_zoomed_view(Image.Resampling.NEAREST)
+        
+        # 4. Debounce the high-quality BILINEAR sharpen pass
+        self.schedule_render()
+
+        # 5. Readjust canvas viewport windows to keep your cursor locked over the original location
+        # This prevents the image elements from drifting across the view panel during adjustments
+        new_mouse_canvas_x = native_target_x * self.zoom_scale
+        new_mouse_canvas_y = native_target_y * self.zoom_scale
+        
+        # Calculate exact pixel drift differentials
+        shift_x = new_mouse_canvas_x - mouse_canvas_x
+        shift_y = new_mouse_canvas_y - mouse_canvas_y
+        
+        # Scroll the viewport window positions dynamically to cancel out position drift
+        # self.canvas.xview_scroll(int(shift_x), "units")
+        # self.canvas.yview_scroll(int(shift_y), "units")
+
+        if self.active_layer_index is not None:
+            self.open_or_update_property_box(self.active_layer_index)
+
+        return "break"
+
+    def _update_zoom_scroll_region(self):
+        """Calculates and applies updated navigation constraints based on the active scale factor."""
+        if not self.current_bg_pil:
+            return
+        w, h = self.current_bg_pil.size
+        # Stretch target tracking boundaries relative to our zoom multiplier vector dimensions
+        scaled_w = int(w * self.zoom_scale)
+        scaled_h = int(h * self.zoom_scale)
+        
+        # Add a light padding margin border to keep canvas handling clean at high zoom values
+        #self.canvas.config(scrollregion=(-100, -100, scaled_w + 100, scaled_h + 100))
 
     def register_close_protocol(self):
         self.winfo_toplevel().protocol("WM_DELETE_WINDOW", self.on_close_cleanup)
 
     def on_close_cleanup(self):
         try:
-            shutdown_event.set()
             self.close_property_box()
             self.canvas.delete("all")
             self.gallery_canvas.delete("all")
@@ -1333,193 +2225,183 @@ class LiveEditor(tk.Frame):
             print(f"Error during widget resource cleanup: {e}")
 
     def _on_dragging(self, event):
-        if self.autosize_enabled.get() or not self.active_layer_id:
+        # 1. Defensively guard against missing active object references
+        if self.active_layer_id is None or self.active_layer_index is None:
             return
 
-        cur_x = self.canvas.canvasx(event.x)
-        cur_y = self.canvas.canvasy(event.y)
-        self.canvas.move(self.active_layer_id, cur_x - self.drag_data["x"], cur_y - self.drag_data["y"])
-        self.drag_data["x"] = cur_x
-        self.drag_data["y"] = cur_y
+        # 2. Calculate raw window pixel distance variations
+        delta_window_x = event.x - self.drag_data["x"]
+        delta_window_y = event.y - self.drag_data["y"]
+        
+        # 3. Physically move the active canvas visual object layer
+        self.canvas.move(self.active_layer_id, delta_window_x, delta_window_y)
+        
+        # Update mouse anchoring indices continuously for the next drag frame delta
+        self.drag_data["x"] = event.x
+        self.drag_data["y"] = event.y
 
-    def fit_background_to_window(self):
+        # 4. CRITICAL FIX: Extract current visual coordinates and sync directly to memory mid-drag
+        current_coords = self.canvas.coords(self.active_layer_id)
+        if current_coords and self.current_img_index != -1:
+            active_bundle = self.gallery_images[self.current_img_index]
+            coords = active_bundle.setdefault("coords", [])
+            
+            # Read real viewport alignment offsets dynamically
+            view_w = self.canvas_container.winfo_width()
+            view_h = self.canvas_container.winfo_height()
+            if view_w <= 1: view_w = 1280
+            if view_h <= 1: view_h = 720
+
+            scaled_w = int(self.bg_width * self.zoom_scale)
+            scaled_h = int(self.bg_height * self.zoom_scale)
+            
+            offset_x = max(0, (view_w - scaled_w) // 2)
+            offset_y = max(0, (view_h - scaled_h) // 2)
+                
+            # Inverse project visual canvas pixel positions back into native image coordinates
+            native_x = int(round((current_coords[0] - offset_x) / self.zoom_scale))
+            native_y = int(round((current_coords[1] - offset_y) / self.zoom_scale))
+            
+            if self.active_layer_index < len(coords):
+                coords[self.active_layer_index] = (native_x, native_y)
+
+        # 5. Redraw the wireframe bounding layout boxes matching the new synced position coordinates
+        self.draw_inline_bounding_boxes()
+
+    def _on_drag_start(self, event, target_id, layer_index):
+        if event.state & 0x0004:
+            return
+
+        self.open_or_update_property_box(layer_index, event)
+
+        self.active_layer_id = target_id
+        self.active_layer_index = layer_index
+        self.canvas.itemconfig(target_id, state="normal")
+        
+        self.drag_data["x"] = event.x
+        self.drag_data["y"] = event.y
+        
+        return "break"  # Prevents event bubbling into the background canvas layer
+
+    def _on_drag_end(self, event, target_id, layer_index):
+        """Processes final positioning cleanup once manual drag operation completes."""
+        if self.current_img_index == -1:
+            return
+
+        current_coords = self.canvas.coords(target_id)
+        if current_coords:
+            active_bundle = self.gallery_images[self.current_img_index]
+            coords = active_bundle.setdefault("coords", [])
+            while len(coords) <= layer_index:
+                coords.append((50, 50))
+                
+            view_w = self.canvas_container.winfo_width()
+            view_h = self.canvas_container.winfo_height()
+            if view_w <= 1: view_w = 1280
+            if view_h <= 1: view_h = 720
+
+            scaled_w = int(self.bg_width * self.zoom_scale)
+            scaled_h = int(self.bg_height * self.zoom_scale)
+            
+            offset_x = max(0, (view_w - scaled_w) // 2)
+            offset_y = max(0, (view_h - scaled_h) // 2)
+                
+            native_x = int(round((current_coords[0] - offset_x) / self.zoom_scale))
+            native_y = int(round((current_coords[1] - offset_y) / self.zoom_scale))
+            coords[layer_index] = (native_x, native_y)
+            
+        # Update the property window immediately on drop to display precise destination points
+        if self.active_layer_index is not None:
+            self.open_or_update_property_box(self.active_layer_index)
+
+    def center_canvas_viewport(self):
+        """
+        Adjusts scrollbars to center the active area when the image overflows the window view.
+        """
         if self.current_img_index == -1 or not self.current_bg_pil:
             return
 
-        data_bundle = self.gallery_images[self.current_img_index]
+        self.update_idletasks()
+        canvas_visible_w = self.canvas_container.winfo_width()
+        canvas_visible_h = self.canvas_container.winfo_height()
+
+        scaled_img_w = int(self.bg_width * self.zoom_scale)
+        scaled_img_h = int(self.bg_height * self.zoom_scale)
+
+        # Center Horizontally (Only if image overflows visible pane)
+        if scaled_img_w > canvas_visible_w:
+            center_x_fraction = ((scaled_img_w - canvas_visible_w) / 2) / scaled_img_w
+            self.canvas.xview_moveto(center_x_fraction)
+        else:
+            self.canvas.xview_moveto(0)
+
+        # Center Vertically (Only if image overflows visible pane)
+        if scaled_img_h > canvas_visible_h:
+            center_y_fraction = ((scaled_img_h - canvas_visible_h) / 2) / scaled_img_h
+            self.canvas.yview_moveto(center_y_fraction)
+        else:
+            self.canvas.yview_moveto(0)
+
+    def _on_window_resize_event(self, event):
+        """Passively tracking changes without breaking canvas zoom layouts."""
+        pass
+    
+    def trigger_fit_to_window(self):
+        """Calculates the best zoom factor to fit the image to the window seamlessly."""
+        if self.current_img_index == -1 or not self.current_bg_pil:
+            return
+
         window_w = self.canvas_container.winfo_width()
         window_h = self.canvas_container.winfo_height()
         if window_w <= 1 or window_h <= 1:
             return
 
         view_w, view_h = max(window_w - 4, 50), max(window_h - 4, 50)
+        img_w, img_h = self.current_bg_pil.size
+        
+        # Calculate aspect ratio boundaries
+        img_aspect = img_w / img_h
+        view_aspect = view_w / view_h
 
-        try:
-            self.canvas.config(width=view_w, height=view_h, bg="black")
-            self.canvas.config(scrollregion=(0, 0, view_w, view_h))
-            composite_canvas_img = Image.new("RGB", (view_w, view_h), color="black")
+        if img_aspect > view_aspect:
+            proposed_scale = view_w / img_w
+        else:
+            proposed_scale = view_h / img_h
 
-            img_w, img_h = self.current_bg_pil.size
-            img_aspect, view_aspect = img_w / img_h, view_w / view_h
+        # Enforce bounds limits cleanly onto your core zoom tracker
+        self.zoom_scale = max(self.min_zoom, min(proposed_scale, self.max_zoom))
+        
+        # Rerender using standard zoom paths so layers are fully active and editable
+        self.render_zoomed_view()
+        self.center_canvas_viewport()
 
-            '''if abs(img_aspect - view_aspect) > 0.3:
-                new_w, new_h = view_w, view_h
-                paste_x, paste_y = 0, 0
-            else:'''
-            if img_aspect > view_aspect:
-                new_w = view_w
-                new_h = int(view_w / img_aspect)
-            else:
-                new_h = view_h
-                new_w = int(view_h * img_aspect)
-            new_w, new_h = max(1, new_w), max(1, new_h)
-            paste_x = (view_w - new_w) // 2
-            paste_y = (view_h - new_h) // 2
-
-            scaled_bg = self.current_bg_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
-            composite_canvas_img.paste(scaled_bg, (paste_x, paste_y))
-
-            self.tk_bg_image = ImageTk.PhotoImage(composite_canvas_img)
-            self.canvas.delete("bg_layer")
-            self.canvas.create_image(0, 0, image=self.tk_bg_image, anchor="nw", tags="bg_layer")
-            self.canvas.tag_lower("bg_layer")
-
-            scale_x = new_w / img_w
-            scale_y = new_h / img_h
-            self.bg_width = view_w
-            self.bg_height = view_h
-
-            self._tk_overlay_cache.clear()
-            self.canvas.delete("draggable_layer")
-
-            layers = data_bundle.get("layers", [])
-            coords = data_bundle.get("coords", [])
-
-            for i, pil_layer in enumerate(layers):
-                if not isinstance(pil_layer, Image.Image):
-                    continue
-                try:
-                    layer_w, layer_h = pil_layer.size
-                    new_l_w = max(1, int(layer_w * scale_x))
-                    new_l_h = max(1, int(layer_h * scale_y))
-
-                    scaled_layer_pil = pil_layer.resize((new_l_w, new_l_h), Image.Resampling.LANCZOS)
-                    tk_layer_img = ImageTk.PhotoImage(scaled_layer_pil)
-                    self._tk_overlay_cache.append(tk_layer_img)
-
-                    orig_x, orig_y = coords[i] if i < len(coords) else (50, 50)
-                    translated_x = int(orig_x * scale_x) + paste_x
-                    translated_y = int(orig_y * scale_y) + paste_y
-
-                    layer_id = self.canvas.create_image(
-                        translated_x, translated_y, image=tk_layer_img, anchor="nw", tags="draggable_layer"
-                    )
-                    self.layer_image_refs[layer_id] = tk_layer_img
-                    self.active_layer_id = layer_id
-
-                    self.canvas.tag_bind(layer_id, "<ButtonPress-1>", lambda event, lid=layer_id, lidx=i: self._on_drag_start(event, lid, lidx))
-                    self.canvas.tag_bind(layer_id, "<B1-Motion>", self._on_dragging)
-                    self.canvas.tag_bind(layer_id, "<ButtonRelease-1>", lambda event, lid=layer_id, lidx=i: self._on_drag_end(event, lid, lidx))
-                except Exception as e:
-                    print(f"Error scaling layer {i}: {e}")
-
-        except Exception as e:
-            print(f"Autosize resizing exception: {e}")
-
-
-def enlarge_window(rect, im_w, im_h, ratio=2.5, aspect_ratio=1.0) -> List:
-    assert ratio > 1.0
+        if self.active_layer_index is not None:
+            self.open_or_update_property_box(self.active_layer_index)
     
-    x1, y1, x2, y2 = rect
-    w = x2 - x1
-    h = y2 - y1
+    def _on_canvas_background_click(self, event):
+        """
+        Triggered when clicking empty space or the background image canvas.
+        Clears the selection state, reverts highlighting, and closes the property window.
+        """
+        # Ignore clicks if the user was using a control modifier (like Ctrl+Click zoom steps)
+        if event.state & 0x0004:
+            return
 
-    if w <= 0 or h <= 0:
-        return [0, 0, 0, 0]
+        # Use canvas coordinate transformations to determine what object is underneath the cursor
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        clicked_items = self.canvas.find_overlapping(canvas_x - 1, canvas_y - 1, canvas_x + 1, canvas_y + 1)
 
-    # https://numpy.org/doc/stable/reference/generated/numpy.roots.html
-    coeff = [aspect_ratio, w+h*aspect_ratio, (1-ratio)*w*h]
-    roots = np.roots(coeff)
-    roots.sort()
-    delta = int(round(roots[-1] / 2))
-    delta_w = int(delta * aspect_ratio)
-    delta_w = min(x1, im_w - x2, delta_w)
-    delta = min(y1, im_h - y2, delta)
-    rect = np.array([x1-delta_w, y1-delta, x2+delta_w, y2+delta], dtype=np.int64)
-    rect[::2] = np.clip(rect[::2], 0, im_w - 1)
-    rect[1::2] = np.clip(rect[1::2], 0, im_h - 1)
-    return rect.tolist()
+        # Check if any overlapping item belongs to a text layer element
+        for item_id in clicked_items:
+            tags = self.canvas.gettags(item_id)
+            if "draggable_layer" in tags:
+                return  # A text block was clicked! Let drag initialization routines handle it safely.
 
-def extract_ballon_region(img: np.ndarray, ballon_rect: List, enlarge_ratio=1, verbose=False) -> Tuple[np.ndarray, int, List]:
+        # Clear active selection indexing trackers if clicking true empty space
+        self.active_layer_id = None
+        self.active_layer_index = None
 
-    x1, y1, x2, y2 = ballon_rect[0], ballon_rect[1], ballon_rect[2] + ballon_rect[0], ballon_rect[3] + ballon_rect[1]
-    if enlarge_ratio > 1:
-        x1, y1, x2, y2 = enlarge_window([x1, y1, x2, y2], img.shape[1], img.shape[0], enlarge_ratio, aspect_ratio=ballon_rect[3] / ballon_rect[2])
+        # Cleanly dismantle and close the active property box frame workflow
+        self.close_property_box()
 
-    img = img[y1:y2, x1:x2].copy()
-
-    kernel = np.ones((3,3), np.uint8)
-    orih, oriw = img.shape[0], img.shape[1]
-    scaleR = 1
-    if orih > 300 and oriw > 300:
-        scaleR = 0.6
-    elif orih < 120 or oriw < 120:
-        scaleR = 1.4
-
-    if scaleR != 1:
-        h, w = img.shape[0], img.shape[1]
-        orimg = np.copy(img)
-        img = cv2.resize(img, (int(w*scaleR), int(h*scaleR)), interpolation=cv2.INTER_AREA)
-    h, w = img.shape[0], img.shape[1]
-    img_area = h * w
-
-    cpimg = cv2.GaussianBlur(img, (3,3), cv2.BORDER_DEFAULT)
-    detected_edges = cv2.Canny(cpimg, 70, 140, L2gradient=True, apertureSize=3)
-    cv2.rectangle(detected_edges, (0, 0), (w-1, h-1), WHITE, 1, cv2.LINE_8)
-    cons, hiers = cv2.findContours(detected_edges, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
-    cv2.rectangle(detected_edges, (0, 0), (w-1, h-1), BLACK, 1, cv2.LINE_8)
-
-    ballon_mask = np.zeros((h, w), np.uint8)
-    min_retval = np.inf
-    mask = np.zeros((h, w), np.uint8)
-    difres = 10
-    seedpnt = (int(w/2), int(h/2))
-    for i in range(len(cons)):
-        rect = cv2.boundingRect(cons[i])
-        if rect[2]*rect[3] < img_area*0.4:
-            continue
-
-        mask = cv2.drawContours(mask, cons, i, (255), 2)
-        cpmask = np.copy(mask)
-        cv2.rectangle(mask, (0, 0), (w-1, h-1), WHITE, 1, cv2.LINE_8)
-        retval, _, _, rect = cv2.floodFill(cpmask, mask=None, seedPoint=seedpnt, flags=4, newVal=(127), loDiff=(difres, difres, difres), upDiff=(difres, difres, difres))
-
-        if retval <= img_area * 0.3:
-            mask = cv2.drawContours(mask, cons, i, (0), 2)
-        if retval < min_retval and retval > img_area * 0.3:
-            min_retval = retval
-            ballon_mask = cpmask
-
-    ballon_mask = 127 - ballon_mask
-    ballon_mask = cv2.dilate(ballon_mask, kernel,iterations = 1)
-    ballon_area, _, _, rect = cv2.floodFill(ballon_mask, mask=None, seedPoint=seedpnt, flags=4, newVal=(30), loDiff=(difres, difres, difres), upDiff=(difres, difres, difres))
-    ballon_mask = 30 - ballon_mask    
-    retval, ballon_mask = cv2.threshold(ballon_mask, 1, 255, cv2.THRESH_BINARY)
-    ballon_mask = cv2.bitwise_not(ballon_mask, ballon_mask)
-
-    box_kernel = int(np.sqrt(ballon_area) / 30)
-    if box_kernel > 1:
-        box_kernel = np.ones((box_kernel,box_kernel),np.uint8)
-        ballon_mask = cv2.dilate(ballon_mask, box_kernel, iterations = 1)
-        ballon_mask = cv2.erode(ballon_mask, box_kernel, iterations = 1)
-
-    if scaleR != 1:
-        img = orimg
-        ballon_mask = cv2.resize(ballon_mask, (oriw, orih))
-
-    if verbose:
-        cv2.imshow('ballon_mask', ballon_mask)
-        cv2.imshow('img', img)
-        cv2.waitKey(0)
-
-    return ballon_mask, [x1, y1, x2, y2]

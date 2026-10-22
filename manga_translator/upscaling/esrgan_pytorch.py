@@ -521,9 +521,9 @@ class ESRGANUpscalerPytorch(OfflineUpscaler):
     async def _load(self, device: str):
         super().__init__()
         os.makedirs(self.model_dir, exist_ok=True)
-        if os.path.exists('4xESRGAN.pth'):
-            shutil.move('4xESRGAN.pth', self._get_file_path('4xESRGAN.pth'))
-        sd = torch.load(self._get_file_path('4xESRGAN.pth'))
+        if os.path.exists('2x-AnimeSharpV3.pth'):
+            shutil.move('2x-AnimeSharpV3.pth', self._get_file_path('2x-AnimeSharpV3.pth'))
+        sd = torch.load(self._get_file_path('2x-AnimeSharpV3.pth'))
         in_nc, out_nc, nf, nb, plus, mscale = infer_params(sd)
         self.model = RRDBNet(in_nc=in_nc, out_nc=out_nc, nf=nf, nb=nb, upscale=mscale, plus=plus)
         self.model.load_state_dict(sd)

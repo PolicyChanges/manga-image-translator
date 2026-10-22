@@ -230,6 +230,14 @@ def set_font(font_path: str):
         selection = FALLBACK_FONTS
     FONT_SELECTION = [get_cached_font(p) for p in selection]
 
+    # Force unbind stale glyphs out of the tracking cache loop 
+    # to guarantee clean layout calculations when swapping font layers
+    try:
+        get_char_glyph.cache_clear()
+    except AttributeError:
+        pass
+
+
 class namespace:
     pass
 
@@ -255,15 +263,33 @@ class Glyph:
 @functools.lru_cache(maxsize = 1024, typed = True)
 def get_char_glyph(cdpt: str, font_size: int, direction: int) -> Glyph:
     global FONT_SELECTION
+
+    # Force cast to string and extract only the first character if a structural text block string arrives
+    cdpt_str = str(cdpt)
+    if len(cdpt_str) != 1:
+        if len(cdpt_str) == 0:
+            cdpt_str = " " # Fallback placeholder token to satisfy glyph parsing loops
+        else:
+            # Slices out individual index bounds to satisfy ord() checks
+            cdpt_str = cdpt_str[0]
+    
     for i, face in enumerate(FONT_SELECTION):
-        if face.get_char_index(cdpt) == 0 and i != len(FONT_SELECTION) - 1:
+        # Using sanitized string token prevents TypeError drops inside face.get_char_index()
+        if face.get_char_index(cdpt_str) == 0 and i != len(FONT_SELECTION) - 1:
             continue
         if direction == 0:
             face.set_pixel_sizes(0, font_size)
         elif direction == 1:
             face.set_pixel_sizes(font_size, 0)
-        face.load_char(cdpt)
-        return Glyph(face.glyph)
+        
+        try:
+            face.load_char(cdpt_str)
+            return Glyph(face.glyph)
+        except Exception:
+            continue
+            
+    return None
+
 
 #@functools.lru_cache(maxsize = 1024, typed = True)
 def get_char_border(cdpt: str, font_size: int, direction: int):

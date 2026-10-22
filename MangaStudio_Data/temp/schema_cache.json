@@ -1,0 +1,644 @@
+{
+    "$defs": {
+        "Alignment": {
+            "enum": [
+                "auto",
+                "left",
+                "center",
+                "right"
+            ],
+            "title": "Alignment",
+            "type": "string"
+        },
+        "Colorizer": {
+            "enum": [
+                "none",
+                "mc2"
+            ],
+            "title": "Colorizer",
+            "type": "string"
+        },
+        "ColorizerConfig": {
+            "properties": {
+                "colorization_size": {
+                    "default": 576,
+                    "title": "Colorization Size",
+                    "type": "integer"
+                },
+                "denoise_sigma": {
+                    "default": 30,
+                    "title": "Denoise Sigma",
+                    "type": "integer"
+                },
+                "colorizer": {
+                    "allOf": [
+                        {
+                            "$ref": "#/$defs/Colorizer"
+                        }
+                    ],
+                    "default": "none"
+                }
+            },
+            "title": "ColorizerConfig",
+            "type": "object"
+        },
+        "Detector": {
+            "enum": [
+                "default",
+                "dbconvnext",
+                "ctd",
+                "craft",
+                "paddle",
+                "none"
+            ],
+            "title": "Detector",
+            "type": "string"
+        },
+        "DetectorConfig": {
+            "properties": {
+                "detector": {
+                    "allOf": [
+                        {
+                            "$ref": "#/$defs/Detector"
+                        }
+                    ],
+                    "default": "default"
+                },
+                "detection_size": {
+                    "default": 2048,
+                    "title": "Detection Size",
+                    "type": "integer"
+                },
+                "text_threshold": {
+                    "default": 0.5,
+                    "title": "Text Threshold",
+                    "type": "number"
+                },
+                "det_rotate": {
+                    "default": false,
+                    "title": "Det Rotate",
+                    "type": "boolean"
+                },
+                "det_auto_rotate": {
+                    "default": false,
+                    "title": "Det Auto Rotate",
+                    "type": "boolean"
+                },
+                "det_invert": {
+                    "default": false,
+                    "title": "Det Invert",
+                    "type": "boolean"
+                },
+                "det_gamma_correct": {
+                    "default": false,
+                    "title": "Det Gamma Correct",
+                    "type": "boolean"
+                },
+                "box_threshold": {
+                    "default": 0.7,
+                    "title": "Box Threshold",
+                    "type": "number"
+                },
+                "unclip_ratio": {
+                    "default": 2.3,
+                    "title": "Unclip Ratio",
+                    "type": "number"
+                }
+            },
+            "title": "DetectorConfig",
+            "type": "object"
+        },
+        "Direction": {
+            "enum": [
+                "auto",
+                "horizontal",
+                "vertical"
+            ],
+            "title": "Direction",
+            "type": "string"
+        },
+        "InpaintPrecision": {
+            "enum": [
+                "fp32",
+                "fp16",
+                "bf16"
+            ],
+            "title": "InpaintPrecision",
+            "type": "string"
+        },
+        "Inpainter": {
+            "enum": [
+                "default",
+                "lama_large",
+                "lama_mpe",
+                "sd",
+                "none",
+                "original"
+            ],
+            "title": "Inpainter",
+            "type": "string"
+        },
+        "InpainterConfig": {
+            "properties": {
+                "inpainter": {
+                    "allOf": [
+                        {
+                            "$ref": "#/$defs/Inpainter"
+                        }
+                    ],
+                    "default": "lama_large"
+                },
+                "inpainting_size": {
+                    "default": 2048,
+                    "title": "Inpainting Size",
+                    "type": "integer"
+                },
+                "inpainting_precision": {
+                    "allOf": [
+                        {
+                            "$ref": "#/$defs/InpaintPrecision"
+                        }
+                    ],
+                    "default": "bf16"
+                }
+            },
+            "title": "InpainterConfig",
+            "type": "object"
+        },
+        "Ocr": {
+            "enum": [
+                "32px",
+                "48px",
+                "48px_ctc",
+                "mocr"
+            ],
+            "title": "Ocr",
+            "type": "string"
+        },
+        "OcrConfig": {
+            "properties": {
+                "use_mocr_merge": {
+                    "default": false,
+                    "title": "Use Mocr Merge",
+                    "type": "boolean"
+                },
+                "ocr": {
+                    "allOf": [
+                        {
+                            "$ref": "#/$defs/Ocr"
+                        }
+                    ],
+                    "default": "48px"
+                },
+                "min_text_length": {
+                    "default": 0,
+                    "title": "Min Text Length",
+                    "type": "integer"
+                },
+                "ignore_bubble": {
+                    "default": 0,
+                    "title": "Ignore Bubble",
+                    "type": "integer"
+                },
+                "prob": {
+                    "anyOf": [
+                        {
+                            "type": "number"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Prob"
+                }
+            },
+            "title": "OcrConfig",
+            "type": "object"
+        },
+        "RenderConfig": {
+            "properties": {
+                "renderer": {
+                    "allOf": [
+                        {
+                            "$ref": "#/$defs/Renderer"
+                        }
+                    ],
+                    "default": "default"
+                },
+                "alignment": {
+                    "allOf": [
+                        {
+                            "$ref": "#/$defs/Alignment"
+                        }
+                    ],
+                    "default": "auto"
+                },
+                "disable_font_border": {
+                    "default": false,
+                    "title": "Disable Font Border",
+                    "type": "boolean"
+                },
+                "font_size_offset": {
+                    "default": 0,
+                    "title": "Font Size Offset",
+                    "type": "integer"
+                },
+                "font_size_minimum": {
+                    "default": -1,
+                    "title": "Font Size Minimum",
+                    "type": "integer"
+                },
+                "direction": {
+                    "allOf": [
+                        {
+                            "$ref": "#/$defs/Direction"
+                        }
+                    ],
+                    "default": "auto"
+                },
+                "uppercase": {
+                    "default": false,
+                    "title": "Uppercase",
+                    "type": "boolean"
+                },
+                "lowercase": {
+                    "default": false,
+                    "title": "Lowercase",
+                    "type": "boolean"
+                },
+                "gimp_font": {
+                    "default": "Sans-serif",
+                    "title": "Gimp Font",
+                    "type": "string"
+                },
+                "no_hyphenation": {
+                    "default": false,
+                    "title": "No Hyphenation",
+                    "type": "boolean"
+                },
+                "font_color": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Font Color"
+                },
+                "line_spacing": {
+                    "anyOf": [
+                        {
+                            "type": "integer"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Line Spacing"
+                },
+                "font_size": {
+                    "anyOf": [
+                        {
+                            "type": "integer"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Font Size"
+                },
+                "rtl": {
+                    "default": true,
+                    "title": "Rtl",
+                    "type": "boolean"
+                }
+            },
+            "title": "RenderConfig",
+            "type": "object"
+        },
+        "Renderer": {
+            "enum": [
+                "default",
+                "manga2eng",
+                "manga2eng_pillow",
+                "none"
+            ],
+            "title": "Renderer",
+            "type": "string"
+        },
+        "Translator": {
+            "enum": [
+                "youdao",
+                "baidu",
+                "deepl",
+                "papago",
+                "caiyun",
+                "chatgpt",
+                "chatgpt_2stage",
+                "none",
+                "original",
+                "sakura",
+                "deepseek",
+                "groq",
+                "gemini",
+                "gemini_2stage",
+                "custom_openai",
+                "offline",
+                "nllb",
+                "nllb_big",
+                "sugoi",
+                "jparacrawl",
+                "jparacrawl_big",
+                "m2m100",
+                "m2m100_big",
+                "m2m100_hf",
+                "m2m100_hf_big",
+                "mbart50",
+                "qwen2",
+                "qwen2_big"
+            ],
+            "title": "Translator",
+            "type": "string"
+        },
+        "TranslatorConfig": {
+            "properties": {
+                "translator": {
+                    "allOf": [
+                        {
+                            "$ref": "#/$defs/Translator"
+                        }
+                    ],
+                    "default": "sugoi"
+                },
+                "target_lang": {
+                    "default": "ENG",
+                    "title": "Target Lang",
+                    "type": "string"
+                },
+                "no_text_lang_skip": {
+                    "default": false,
+                    "title": "No Text Lang Skip",
+                    "type": "boolean"
+                },
+                "skip_lang": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Skip Lang"
+                },
+                "gpt_config": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Gpt Config"
+                },
+                "translator_chain": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Translator Chain"
+                },
+                "selective_translation": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Selective Translation"
+                },
+                "enable_post_translation_check": {
+                    "default": true,
+                    "title": "Enable Post Translation Check",
+                    "type": "boolean"
+                },
+                "post_check_max_retry_attempts": {
+                    "default": 3,
+                    "title": "Post Check Max Retry Attempts",
+                    "type": "integer"
+                },
+                "post_check_repetition_threshold": {
+                    "default": 20,
+                    "title": "Post Check Repetition Threshold",
+                    "type": "integer"
+                },
+                "post_check_target_lang_threshold": {
+                    "default": 0.5,
+                    "title": "Post Check Target Lang Threshold",
+                    "type": "number"
+                }
+            },
+            "title": "TranslatorConfig",
+            "type": "object"
+        },
+        "UpscaleConfig": {
+            "properties": {
+                "upscaler": {
+                    "allOf": [
+                        {
+                            "$ref": "#/$defs/Upscaler"
+                        }
+                    ],
+                    "default": "esrgan"
+                },
+                "revert_upscaling": {
+                    "default": false,
+                    "title": "Revert Upscaling",
+                    "type": "boolean"
+                },
+                "upscale_ratio": {
+                    "anyOf": [
+                        {
+                            "type": "integer"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Upscale Ratio"
+                }
+            },
+            "title": "UpscaleConfig",
+            "type": "object"
+        },
+        "Upscaler": {
+            "enum": [
+                "waifu2x",
+                "esrgan",
+                "4xultrasharp"
+            ],
+            "title": "Upscaler",
+            "type": "string"
+        }
+    },
+    "properties": {
+        "filter_text": {
+            "anyOf": [
+                {
+                    "type": "string"
+                },
+                {
+                    "type": "null"
+                }
+            ],
+            "default": null,
+            "title": "Filter Text"
+        },
+        "render": {
+            "allOf": [
+                {
+                    "$ref": "#/$defs/RenderConfig"
+                }
+            ],
+            "default": {
+                "renderer": "default",
+                "alignment": "auto",
+                "disable_font_border": false,
+                "font_size_offset": 0,
+                "font_size_minimum": -1,
+                "direction": "auto",
+                "uppercase": false,
+                "lowercase": false,
+                "gimp_font": "Sans-serif",
+                "no_hyphenation": false,
+                "font_color": null,
+                "line_spacing": null,
+                "font_size": null,
+                "rtl": true
+            }
+        },
+        "upscale": {
+            "allOf": [
+                {
+                    "$ref": "#/$defs/UpscaleConfig"
+                }
+            ],
+            "default": {
+                "upscaler": "esrgan",
+                "revert_upscaling": false,
+                "upscale_ratio": null
+            }
+        },
+        "translator": {
+            "allOf": [
+                {
+                    "$ref": "#/$defs/TranslatorConfig"
+                }
+            ],
+            "default": {
+                "translator": "sugoi",
+                "target_lang": "ENG",
+                "no_text_lang_skip": false,
+                "skip_lang": null,
+                "gpt_config": null,
+                "translator_chain": null,
+                "selective_translation": null,
+                "enable_post_translation_check": true,
+                "post_check_max_retry_attempts": 3,
+                "post_check_repetition_threshold": 20,
+                "post_check_target_lang_threshold": 0.5
+            }
+        },
+        "detector": {
+            "allOf": [
+                {
+                    "$ref": "#/$defs/DetectorConfig"
+                }
+            ],
+            "default": {
+                "detector": "default",
+                "detection_size": 2048,
+                "text_threshold": 0.5,
+                "det_rotate": false,
+                "det_auto_rotate": false,
+                "det_invert": false,
+                "det_gamma_correct": false,
+                "box_threshold": 0.7,
+                "unclip_ratio": 2.3
+            }
+        },
+        "colorizer": {
+            "allOf": [
+                {
+                    "$ref": "#/$defs/ColorizerConfig"
+                }
+            ],
+            "default": {
+                "colorization_size": 576,
+                "denoise_sigma": 30,
+                "colorizer": "none"
+            }
+        },
+        "inpainter": {
+            "allOf": [
+                {
+                    "$ref": "#/$defs/InpainterConfig"
+                }
+            ],
+            "default": {
+                "inpainter": "lama_large",
+                "inpainting_size": 2048,
+                "inpainting_precision": "bf16"
+            }
+        },
+        "ocr": {
+            "allOf": [
+                {
+                    "$ref": "#/$defs/OcrConfig"
+                }
+            ],
+            "default": {
+                "use_mocr_merge": false,
+                "ocr": "48px",
+                "min_text_length": 0,
+                "ignore_bubble": 0,
+                "prob": null
+            }
+        },
+        "force_simple_sort": {
+            "default": false,
+            "title": "Force Simple Sort",
+            "type": "boolean"
+        },
+        "kernel_size": {
+            "default": 3,
+            "title": "Kernel Size",
+            "type": "integer"
+        },
+        "mask_dilation_offset": {
+            "default": 20,
+            "title": "Mask Dilation Offset",
+            "type": "integer"
+        }
+    },
+    "title": "Config",
+    "type": "object"
+}

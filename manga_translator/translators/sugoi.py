@@ -57,6 +57,7 @@ class JparacrawlTranslator(OfflineTranslator):
     #     subprocess.check_call(cmds)
 
     async def _load(self, from_lang: str, to_lang: str, device: str):
+
         if from_lang == 'auto':
             if to_lang == 'en':
                 from_lang = 'ja'
@@ -73,11 +74,14 @@ class JparacrawlTranslator(OfflineTranslator):
             ct2_device = 'cpu'
         else:
             ct2_device = device
+        import torch
+        torch.cuda.empty_cache()
         self.model = ctranslate2.Translator(
             model_path=self._get_file_path(self._CT2_MODEL_FOLDERS[f'{from_lang}-{to_lang}']),
             device=ct2_device,
             device_index=0,
         )
+
         self.model.load_model()
         self.sentence_piece_processors = {
             'en': spm.SentencePieceProcessor(model_file=self._get_file_path('jparacrawl/spm.en.nopretok.model')),
@@ -170,6 +174,8 @@ class SugoiTranslator(JparacrawlBigTranslator):
         super().__init__()
 
     async def _load(self, from_lang: str, to_lang: str, device: str):
+        from ..nvutils import wait_for_gpu_memory
+        wait_for_gpu_memory(device, 0, 4.0, 1, 10)
         await super()._load(from_lang, to_lang, device)
         self.sentence_piece_processors['en-sugoi'] = spm.SentencePieceProcessor(model_file=self._get_file_path('sugoi/spm.en.nopretok.model'))
         self.sentence_piece_processors['ja-sugoi'] = spm.SentencePieceProcessor(model_file=self._get_file_path('sugoi/spm.ja.nopretok.model'))

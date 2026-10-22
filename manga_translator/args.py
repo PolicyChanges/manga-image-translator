@@ -87,6 +87,8 @@ def general_parser(g_parser):
     g = g_parser.add_mutually_exclusive_group()
     g.add_argument('--use-gpu', action='store_true', help='Turn on/off gpu (auto switch between mps and cuda)')
     g.add_argument('--use-gpu-limited', action='store_true', help='Turn on/off gpu (excluding offline translator)')
+    g_parser.add_argument('--multi-gpu', action='store_true', help='Enables balanced parallelized scaling across multiple local GPUs.')
+    g_parser.add_argument('--live-editor', action='store_true', help='Run live editor while translating folder.')
     g_parser.add_argument('--font-path', default='', type=file_path, help='Path to font file')
     g_parser.add_argument('--pre-dict', default=None, type=file_path, help='Path to the pre-translation dictionary file')
     g_parser.add_argument('--post-dict', default=None, type=file_path,

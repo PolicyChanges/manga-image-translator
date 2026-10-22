@@ -2,6 +2,10 @@ import os
 import sys
 import asyncio
 import logging
+import tkinter as tk
+import threading
+import queue
+import copy
 from argparse import Namespace
 
 from manga_translator import Config
@@ -16,10 +20,93 @@ from .utils import (
     get_logger,
     set_log_level,
     natural_sort,
+    LiveEditor,
+    run_async_server_loop,
+    register_editor_instance,
+    image_stream_queue,
+    shutdown_event
 )
+import subprocess
 
-# TODO: Dynamic imports to reduce ram usage in web(-server) mode. Will require dealing with args.py imports.
+def poll_incoming_stream_queue(editor_widget):
+    """Periodically drains incoming rendered contexts from the translation pipeline."""
+    try:
+        while True:
+            new_ctx, path, config = image_stream_queue.get_nowait()
+            image_stream_queue.task_done
+            editor_widget.append_image(image_dict=new_ctx, path=path, config=config)
+    except queue.Empty:
+        pass
+    editor_widget.master.after(100, lambda: poll_incoming_stream_queue(editor_widget))
 
+
+def spawn_detached_editor_ui_local(initial_images=None):
+    """Runs the Tkinter event loop in a dedicated GUI thread."""
+    root = tk.Tk()
+    root.title("Live Stream Editor")
+    root.geometry("1280x720")
+
+    root.overrideredirect(True)
+    root.overrideredirect(False)
+
+    #root.attributes("-fullscreen", True)
+    #root.wm_attributes("-topmost", 1)
+    root.focus_set()
+
+    root.bind("<Escape>", lambda event: root.attributes("-fullscreen", False))
+    root.bind("<F11>", lambda event: root.attributes("-fullscreen", not root.attributes("-fullscreen")))
+
+    editor_widget = LiveEditor(root, initial_image_dict=initial_images)
+    editor_widget.pack(fill="both", expand=True)
+    editor_widget.register_close_protocol()
+
+    poll_incoming_stream_queue(editor_widget)
+    root.mainloop()
+
+    shutdown_event.set()
+
+def spawn_detached_editor_ui(initial_images=None):
+    """Runs the Tkinter event loop in a dedicated GUI thread alongside the IPC server."""
+    # Open local loopback interface port listener 
+    server_thread = threading.Thread(
+        target=run_async_server_loop, 
+        args=("127.0.0.1", 5003), 
+        daemon=True,
+        name="MangaTranslator-IPC-Server"
+    )
+    server_thread.start()
+
+    root = tk.Tk()
+    root.title("Live Stream Editor")
+    root.geometry("1280x720")
+
+    root.overrideredirect(True)
+    root.overrideredirect(False)
+
+    #root.attributes("-fullscreen", True)
+    #root.wm_attributes("-topmost", 1)
+    root.focus_set()
+
+    root.bind("<Escape>", lambda event: root.attributes("-fullscreen", False))#lambda event:root.destroy())
+    root.bind("<F11>", lambda event: root.attributes("-fullscreen", not root.attributes("-fullscreen")))
+
+    editor_widget = LiveEditor(root, initial_image_dict=initial_images)
+    editor_widget.pack(fill="both", expand=True)
+    editor_widget.register_close_protocol()
+
+    # Map the live widget reference so the background socket server can pass data frames directly into it
+    register_editor_instance(editor_widget)
+    
+    root.mainloop()
+
+    subprocess.run(["killall", "python"], shell=True)
+    # Clean up loop tasks when the Tkinter window workspace is destroyed by the user
+    if _SERVER_LOOP is not None:
+        _SERVER_LOOP.call_soon_threadsafe(_SERVER_LOOP.stop)
+        
+    shutdown_event.set()
+
+    
 async def dispatch(args: Namespace):
     args_dict = vars(args)
 
@@ -35,12 +122,14 @@ async def dispatch(args: Namespace):
         pre_dict = load_dictionary(args.pre_dict)
         post_dict = load_dictionary(args.post_dict)
 
-        if len(args.input) == 1 and os.path.isfile(args.input[0]):
+        raw_input = args.input if isinstance(args.input, list) and args.input else args.input
+        
+        if raw_input and os.path.isfile(str(raw_input)) and (not isinstance(args.input, list) or len(args.input) == 1):
             dest = os.path.join(BASE_PATH, 'result/final.png')
-            args.overwrite = True # Do overwrite result/final.png file
+            args.overwrite = True
 
             # Apply pre-translation dictionaries
-            await translator.translate_path(args.input[0], dest, args_dict)
+            await translator.translate_path(str(raw_input), dest, args_dict)
             for textline in translator.textlines:
                 textline.text = apply_dictionary(textline.text, pre_dict)
                 logger.info(f'Pre-translation dictionary applied: {textline.text}')
@@ -52,14 +141,15 @@ async def dispatch(args: Namespace):
 
         else: # batch
             dest = args.dest
-            for path in natural_sort(args.input):
-                    # Apply pre-translation dictionaries
+            target_iterable = args.input if isinstance(args.input, list) else [args.input]
+            for path in natural_sort(target_iterable):
+                # Apply pre-translation dictionaries
                 await translator.translate_path(path, dest, args_dict)
                 for textline in translator.textlines:
                     textline.text = apply_dictionary(textline.text, pre_dict)
                     logger.info(f'Pre-translation dictionary applied: {textline.text}')
 
-                    # Apply post-translation dictionaries
+                # Apply post-translation dictionaries
                 for textline in translator.textlines:
                     textline.translation = apply_dictionary(textline.translation, post_dict)
                     logger.info(f'Post-translation dictionary applied: {textline.translation}')
@@ -73,15 +163,15 @@ async def dispatch(args: Namespace):
         from manga_translator.mode.share import MangaShare
         translator = MangaShare(args_dict)
         await translator.listen(args_dict)
+        
     elif args.mode == 'config-help':
         import json
         config = Config.schema()
         print(json.dumps(config, indent=2))
 
-
-
 if __name__ == '__main__':
     args = None
+    ui_thread = None
     init_logging()
     try:
         args, unknown = parser.parse_known_args()
@@ -91,8 +181,29 @@ if __name__ == '__main__':
         set_main_logger(logger)
         if args.mode != 'web':
             logger.debug(args)
+        
+        if getattr(args, 'multi_gpu', False) or '--multi-gpu' in sys.argv:
+            ui_thread = threading.Thread(
+                target=spawn_detached_editor_ui,
+                args=(None,),
+                daemon=False
+            )
+            ui_thread.start()
+            # Route processing out to our helper script located cleanly inside utils module layers
+            from .utils.multi_gpu import handle_multi_gpu_execution
+            handle_multi_gpu_execution(args, logger) 
+        else:        
+            if getattr(args, 'live_editor', False) or '--live-editor' in sys.argv:
+                ui_thread = threading.Thread(
+                    target=spawn_detached_editor_ui_local,
+                    args=(None,),
+                    daemon=False #todo True
+                )
+                ui_thread.start()  
+            # Base execution path fallback
+            asyncio.run(dispatch(args))
 
-        asyncio.run(dispatch(args))
+
     except KeyboardInterrupt:
         print('\nTranslation cancelled by user.')
         sys.exit(0)
@@ -102,3 +213,8 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f'{e.__class__.__name__}: {e}',
                      exc_info=e if args and args.verbose else None)
+
+    #while not shutdown_event.is_set():
+    #    time.sleep(1)
+    if ui_thread is not None:
+        ui_thread.join()

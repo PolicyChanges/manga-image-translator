@@ -5,4 +5,4 @@ else
     exit 0
 fi
 
-python -m manga_translator local --config-file ./editor-config.json --font-path fonts/anime_ace.ttf --overwrite --use-gpu -i $1 
+python -m manga_translator local --verbose --config-file ./editor-config.json --font-path fonts/anime_ace.ttf --overwrite --use-gpu --live-editor -i $1 

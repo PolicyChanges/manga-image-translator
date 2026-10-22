@@ -1,16 +1,20 @@
 import json
+import asyncio
+import sys
+import cv2
+import numpy as np
+import websockets
+import json
 import os
 import gc
 import copy
+import queue
+import threading
 from typing import Union, List
 import time  
 
 from PIL import Image
 import psutil
-
-import tkinter as tk
-import threading
-import queue
 
 from manga_translator import MangaTranslator, Context, TranslationInterrupt, Config
 from ..save import save_result
@@ -18,7 +22,91 @@ from ..translators import (
     LanguageUnsupportedException,
     dispatch as dispatch_translation,
 )
-from ..utils import natural_sort, replace_prefix, get_color_name, rgb2hex, get_logger, LiveEditor, image_stream_queue, shutdown_event
+from ..utils import natural_sort, replace_prefix, get_color_name, rgb2hex, get_logger, image_stream_queue, shutdown_event
+
+async def stream_context_to_editor_server(ctx_dict, dest_path, config, host="127.0.0.1", port=5003):
+    """
+    Serializes contextual text arrays, processes tracking tags, and packages 
+    compressed binary buffers for zero-loss matrix transmission to the Editor.
+    """
+    uri = f"ws://{host}:{port}/ws/ipc/append_image"
+    
+    # 1. Extract heavy image array matrices out of the dictionary block
+    img_rgb = ctx_dict.get('img_rgb', None)
+    img_inpainted = ctx_dict.get('img_inpainted', None)
+    
+    # 2. Transform custom internal descriptors recursively down into pure dict primitives
+    def sanitize(obj):
+        if isinstance(obj, (str, int, float, bool, type(None))):
+            return obj
+        elif isinstance(obj, dict):
+            return {k: sanitize(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple, set)):
+            return [sanitize(v) for v in obj]
+        elif isinstance(obj, np.ndarray):
+            if obj.size <= 32:
+                return obj.tolist()
+            return None
+        elif hasattr(obj, '__dict__'):
+            data_dict = {}
+            for k, v in obj.__dict__.items():
+                data_dict[k] = sanitize(v)
+            for attr_name in ('xyxy', 'xywh', 'bg_colors', 'fg_colors'):
+                if hasattr(obj, attr_name) and attr_name not in data_dict:
+                    val = getattr(obj, attr_name)
+                    if hasattr(val, 'tolist'):
+                        data_dict[attr_name] = val.tolist()
+                    elif hasattr(val, 'cpu'):
+                        data_dict[attr_name] = val.cpu().numpy().tolist()
+                    else:
+                        data_dict[attr_name] = sanitize(val)
+            return data_dict
+        else:
+            if hasattr(obj, 'tolist'):
+                return obj.tolist()
+            return str(obj)
+
+    # 3. Compress spatial image data profiles to optimize transmission efficiency
+    rgb_bytes = b""
+    if img_rgb is not None:
+        success, encoded = cv2.imencode('.png', img_rgb)
+        if success:
+            rgb_bytes = encoded.tobytes()
+
+    inpainted_bytes = b""
+    if img_inpainted is not None:
+        success, encoded = cv2.imencode('.png', img_inpainted)
+        if success:
+            inpainted_bytes = encoded.tobytes()
+
+    # 4. FIX: Sanitize the config object down to serializable base primitives
+    payload_metadata = {
+        "dest": str(dest_path),
+        "ctx": sanitize(ctx_dict),
+        "config": sanitize(config),
+        "has_rgb": img_rgb is not None,
+        "has_inpainted": img_inpainted is not None
+    }
+    
+    metadata_json_bytes = json.dumps(payload_metadata).encode('utf-8')
+    
+    # 5. Pack binary frames via custom layout headers to bypass pickling boundaries
+    json_len = len(metadata_json_bytes)
+    rgb_len = len(rgb_bytes)
+    
+    header = json_len.to_bytes(4, byteorder='big') + rgb_len.to_bytes(4, byteorder='big')
+    full_binary_packet = header + metadata_json_bytes + rgb_bytes + inpainted_bytes
+
+    # 6. Stripped multi-gpu and gpu_id routing channels out cleanly
+    try:
+        async with websockets.connect(uri, max_size=None) as websocket:
+            await websocket.send(full_binary_packet)
+            await websocket.recv()  # Await acknowledgment response block
+    except ConnectionRefusedError:
+        pass
+    except Exception as e:
+        print(f"[IPC Emitter Error] Failed to stream multi-part chunk payload: {e}", file=sys.stderr)
+
 
 # 使用专用的local logger
 logger = get_logger('local')
@@ -73,35 +161,7 @@ def force_cleanup():
         ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1, -1)
     except:
         pass
-        
-def poll_incoming_stream_queue(editor_widget):
-    """Periodically drains incoming rendered contexts from the translation pipeline."""
-    try:
-        while True:
-            new_ctx, path = image_stream_queue.get_nowait()
-            image_stream_queue.task_done
-            editor_widget.append_image(image_dict=copy.deepcopy(new_ctx), path=path)
-    except queue.Empty:
-        pass
-    editor_widget.master.after(100, lambda: poll_incoming_stream_queue(editor_widget))
 
-
-def spawn_detached_editor_ui(initial_images=None):
-    """Runs the Tkinter event loop in a dedicated GUI thread."""
-    root = tk.Tk()
-    root.title("Live Stream Editor")
-    root.geometry("1280x720")
-
-    editor_widget = LiveEditor(root, initial_image_dict=initial_images)
-    editor_widget.pack(fill="both", expand=True)
-    editor_widget.register_close_protocol()
-
-    poll_incoming_stream_queue(editor_widget)
-    root.mainloop()
-
-    shutdown_event.set()
-    #subprocess.run(["killall", "python"])
-    
 class MangaTranslatorLocal(MangaTranslator):
     def __init__(self, params: dict = None):
         super().__init__(params)
@@ -116,13 +176,7 @@ class MangaTranslatorLocal(MangaTranslator):
         self.prep_manual = params.get('prep_manual', None)
         self.batch_size = params.get('batch_size', 1)
         self.disable_memory_optimization = params.get('disable_memory_optimization', False)
-        self.ui_thread = threading.Thread(
-            target=spawn_detached_editor_ui,
-            args=(None,),
-            daemon=False #todo True
-        )
-        self.ui_thread.start()
-        #todo self.ui_thread.join()
+        #self.live_editor = params.get('live_editor')
         
     async def translate_path(self, path: str, dest: str = None, params: dict[str, Union[int, str]] = None):
         """
@@ -249,6 +303,7 @@ class MangaTranslatorLocal(MangaTranslator):
 
         logger.info(f'Translating: "{path}"')
 
+        args_dict = params.copy()
         # Turn dict to context to make values also accessible through params.<property>
         params = params or {}
         ctx = Context(**params)
@@ -259,7 +314,7 @@ class MangaTranslatorLocal(MangaTranslator):
                 logger.info(f'Retrying translation! Attempt {attempts}'
                             + (f' of {self.attempts}' if self.attempts != -1 else ''))
             try:
-                return await self._translate_file(path, dest, config, ctx)
+                return await self._translate_file(path, dest, config, ctx, params)
 
             except TranslationInterrupt:
                 break
@@ -276,7 +331,7 @@ class MangaTranslatorLocal(MangaTranslator):
             attempts += 1
         return False
 
-    async def _translate_file(self, path: str, dest: str, config: Config, ctx: Context) -> bool:
+    async def _translate_file(self, path: str, dest: str, config: Config, ctx: Context, args_dict: dict) -> bool:
         if path.endswith('.txt'):
             with open(path, 'r') as f:
                 queries = f.read().split('\n')
@@ -306,9 +361,11 @@ class MangaTranslatorLocal(MangaTranslator):
             ctx = await self.translate(img, config)
             result = ctx.result
 
-            if ctx.img_inpainted is not None: # and params.get('use-mtpe-tk'):
-                image_stream_queue.put((ctx,dest))
-                
+            if args_dict.get('live_editor', False):
+                ctx_payload = ctx if isinstance(ctx, dict) else vars(ctx)
+                if ctx.img_inpainted is not None:   
+                    await stream_context_to_editor_server(ctx_payload, dest, config, host="127.0.0.1", port=5003)
+
             # TODO
             # Proper way to use the config but for now juste pass what we miss here ton ctx
             # Because old methods are still using for example ctx.gimp_font

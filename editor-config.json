@@ -7,7 +7,7 @@
     "direction": "auto",
     "uppercase": false,
     "lowercase": false,
-    "gimp_font": "anime_ace_3",
+    "gimp_font": "anime_ace",
     "no_hyphenation": false,
     "font_color": null,
     "line_spacing": null,
@@ -37,7 +37,7 @@
     "det_invert": false,
     "det_gamma_correct": false,
     "box_threshold": 0.5,
-    "unclip_ratio": 2.3
+    "unclip_ratio": 2.8
   },
   "colorizer": {
     "colorization_size": 800,
@@ -45,7 +45,7 @@
     "colorizer": "none"
   },
   "inpainter": {
-    "inpainter": "default",
+    "inpainter": "lama_large",
     "inpainting_size": 2048,
     "inpainting_precision": "fp32"
   },

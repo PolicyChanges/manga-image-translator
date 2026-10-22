@@ -25,6 +25,8 @@ class AotInpainter(LamaMPEInpainter):
 
     async def _load(self, device: str):
         self.model = AOTGenerator()
+        from ..nvutils import wait_for_gpu_memory
+        await wait_for_gpu_memory(device, 0, 5.0, 1, 20)
         sd = torch.load(self._get_file_path('inpainting.ckpt'), map_location='cpu')
         self.model.load_state_dict(sd['model'] if 'model' in sd else sd)
         self.model.eval()
@@ -141,8 +143,11 @@ class GatedWSTransposeConvPadded(nn.Module):
         self.conv_gate = ScaledWSTransposeConv2d(in_ch, out_ch, kernel_size = ks, stride = stride, padding = (ks - 1) // 2)
 
     def forward(self, x):
+        from ..nvutils import wait_for_gpu_memory
+        wait_for_gpu_memory('cuda:0', 0, 5.0, 1, 20)
         signal = self.conv(x)
         gate = torch.sigmoid(self.conv_gate(x))
+
         return signal * gate * 1.8
 
 class ResBlock(nn.Module):
