@@ -24,7 +24,6 @@ from ..translators import (
 )
 from ..utils import natural_sort, replace_prefix, get_color_name, rgb2hex, get_logger, shutdown_event, stream_context_to_editor_server 
 
-
 # 使用专用的local logger
 logger = get_logger('local')
 
@@ -279,9 +278,10 @@ class MangaTranslatorLocal(MangaTranslator):
             result = ctx.result
 
             if args_dict.get('live_editor', False):
+                if ctx.img_inpainted is None:   
+                    ctx.img_inpainted = ctx.img_rgb.copy()
                 ctx_payload = ctx if isinstance(ctx, dict) else vars(ctx)
-                if ctx.img_inpainted is not None:   
-                    await stream_context_to_editor_server(ctx_payload, dest, config, host="127.0.0.1", port=5003)
+                await stream_context_to_editor_server(ctx_payload, dest, config, host="127.0.0.1", port=5003)
 
             # TODO
             # Proper way to use the config but for now juste pass what we miss here ton ctx

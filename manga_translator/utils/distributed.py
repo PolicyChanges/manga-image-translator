@@ -187,7 +187,13 @@ def handle_multi_gpu_execution(args, logger):
             multiprocessing.set_start_method('spawn', force=True)
         except RuntimeError:
             pass
-
+    # TODO:
+    """
+    if os.name != 'nt':
+        old_umask = os.umask(int('00o077',base=8))
+    else:
+        old_umask = None
+    """
     try:
         for i in range(active_worker_count):
             start_idx = i * chunk_size
@@ -227,6 +233,10 @@ def handle_multi_gpu_execution(args, logger):
             p.join()
 
     finally:
+        # Restore original system umask values once protected creation cycles complete
+        if os.name != 'nt':
+            os.umask(old_umask)
+
         logger.info("Initializing background temporary folder structure teardown routines...")
         for staging_path in staging_dirs:
             if staging_path.exists():

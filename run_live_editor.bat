@@ -7,4 +7,4 @@ if exist "%~1\" (
     exit /b 0
 )
 
-python -m manga_translator local --config-file ./editor-config.json --font-path fonts/anime_ace.ttf --overwrite --use-gpu -i "%~1"
+python -m manga_translator local --config-file ./editor-config.json --overwrite --use-gpu --live-editor -i "%~1"

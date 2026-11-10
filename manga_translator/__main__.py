@@ -91,7 +91,7 @@ if __name__ == '__main__':
     args = None
     ui_thread = None
     init_logging()
-    #os.environ['PYTORCH_CUDA_ALLOC_CONF']="expandable_segments:True"
+    
     try:
         args, unknown = parser.parse_known_args()
         args = Namespace(**{**vars(args), **vars(reparse(unknown))})
@@ -109,7 +109,7 @@ if __name__ == '__main__':
             )
             ui_thread.start()
             # Route processing out to our helper script located cleanly inside utils module layers
-            from .utils.multi_gpu import handle_multi_gpu_execution
+            from .utils.distributed import handle_multi_gpu_execution
             handle_multi_gpu_execution(args, logger) 
         else:        
             if getattr(args, 'live_editor', False) or '--live-editor' in sys.argv:
@@ -121,7 +121,6 @@ if __name__ == '__main__':
                 ui_thread.start()  
             # Base execution path fallback
             asyncio.run(dispatch(args))
-
 
     except KeyboardInterrupt:
         print('\nTranslation cancelled by user.')

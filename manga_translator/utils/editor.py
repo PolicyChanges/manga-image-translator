@@ -334,7 +334,104 @@ class ReconstitutedNamespace:
         elif name == 'bg_colors':
             return np.array([255, 255, 255], dtype=np.uint8)
         return ""
+"""
+# Initialize global reassembly tracking variables at the module level
+_NEXT_EXPECTED_PAGE_NUM = 1
+_OUT_OF_ORDER_BUFFER = {}
 
+async def pure_websocket_handler(websocket):
+    '''
+    Synchronized connection router. Restructures out-of-order incoming multi-GPU 
+    payload streams into perfect sequential order before serving them to the UI.
+    '''
+    global _NEXT_EXPECTED_PAGE_NUM, _OUT_OF_ORDER_BUFFER
+    try:
+        async for packet_bytes in websocket:
+            if len(packet_bytes) < 8:
+                continue
+                
+            # 1. Parse custom multi-part offset boundaries 
+            json_len = int.from_bytes(packet_bytes[0:4], byteorder='big')
+            rgb_len = int.from_bytes(packet_bytes[4:8], byteorder='big')
+            
+            meta_start = 8
+            meta_end = meta_start + json_len
+            rgb_start = meta_end
+            rgb_end = rgb_start + rgb_len
+            inpainted_start = rgb_end
+            
+            # 2. Extract alphanumeric payload properties
+            metadata_payload = json.loads(packet_bytes[meta_start:meta_end].decode('utf-8'))
+            path_string = metadata_payload.get("dest")
+            config_data = metadata_payload.get("config")
+
+            image_dict = metadata_payload.get("ctx", {})
+            if not isinstance(image_dict, dict):
+                image_dict = {"raw_data": image_dict}
+            
+            # 3. Decompress binary frame allocations back to NumPy array grids
+            if metadata_payload.get("has_rgb") and rgb_len > 0:
+                rgb_buf = np.frombuffer(packet_bytes[rgb_start:rgb_end], dtype=np.uint8)
+                image_dict["img_rgb"] = cv2.imdecode(rgb_buf, cv2.IMREAD_COLOR)
+            else:
+                image_dict["img_rgb"] = None
+
+            if metadata_payload.get("has_inpainted"):
+                inpainted_buf = np.frombuffer(packet_bytes[inpainted_start:], dtype=np.uint8)
+                image_dict["img_inpainted"] = cv2.imdecode(inpainted_buf, cv2.IMREAD_COLOR)
+            else:
+                image_dict["img_inpainted"] = None
+
+            # Reconstitute dictionary mappings to support dot-notation properties safely
+            raw_regions = image_dict.get('text_regions') or []
+            image_dict['text_regions'] = [ReconstitutedNamespace(r) if isinstance(r, dict) else r for r in raw_regions]
+
+            # Warm-up pass filtering protection
+            if "warmup" in str(path_string).lower() or config_data is None or image_dict.get("img_inpainted") is None:
+                await websocket.send(json.dumps({"status": "acknowledged"}))
+                continue
+
+            # ----------------------------------------------------
+            # ORDERED STREAM REASSEMBLY QUEUE
+            # ----------------------------------------------------
+            # Extract the actual integer page digit from the filename (e.g., 'page_0043.png' -> 43)
+            filename = os.path.basename(str(path_string))
+            digits = re.findall(r'\d+', filename)
+            current_page_num = int(digits[-1]) if digits else _NEXT_EXPECTED_PAGE_NUM
+
+            normalized_path = os.path.normpath(str(path_string))
+            payload_packet = (image_dict, normalized_path, config_data)
+
+            # Check if this page arrived out of sequence
+            if current_page_num != _NEXT_EXPECTED_PAGE_NUM:
+                # Cache it in our out-of-order sorting dictionary buffer
+                _OUT_OF_ORDER_BUFFER[current_page_num] = payload_packet
+                await websocket.send(json.dumps({"status": "acknowledged"}))
+                continue
+
+            # If it is the correct next page, dispatch it to the UI immediately
+            if _ACTIVE_EDITOR_WIDGET is not None:
+                if hasattr(_ACTIVE_EDITOR_WIDGET, '_tk_overlay_cache'):
+                    _ACTIVE_EDITOR_WIDGET._tk_overlay_cache.clear()
+                _ACTIVE_EDITOR_WIDGET.append_image(image_dict, path=normalized_path, config=config_data)
+            
+            _NEXT_EXPECTED_PAGE_NUM += 1
+
+            # Cascade loop: Check if the next sequential pages are already sitting in the buffer
+            while _NEXT_EXPECTED_PAGE_NUM in _OUT_OF_ORDER_BUFFER:
+                next_payload = _OUT_OF_ORDER_BUFFER.pop(_NEXT_EXPECTED_PAGE_NUM)
+                next_img, next_path, next_cfg = next_payload
+                
+                if _ACTIVE_EDITOR_WIDGET is not None:
+                    _ACTIVE_EDITOR_WIDGET.append_image(next_img, path=next_path, config=next_cfg)
+                
+                _NEXT_EXPECTED_PAGE_NUM += 1
+
+            await websocket.send(json.dumps({"status": "acknowledged"}))
+            
+    except Exception as e:
+        print(f"[IPC Server Error] Stream processing exception encountered: {e}", file=sys.stderr)
+"""
 async def pure_websocket_handler(websocket):
     """
     Pure Python WebSocket connection router. Handles extraction 
@@ -1073,10 +1170,6 @@ class LiveEditor(tk.Frame):
         else:
             self._show_placeholder_text()
 
-        # Re-mapped page turn workflows to Alt + Arrow combinations to stay clear of nudge keys
-        self.bind_all("<Alt-Left>", lambda e: self._on_arrow_left_press(e) if not self.property_box_has_focus else None)
-        self.bind_all("<Alt-Right>", lambda e: self._on_arrow_right_press(e) if not self.property_box_has_focus else None)
-
         self.zoom_scale = -1.0         # 1.0 represents 100% native size resolution
         self.min_zoom = 0.15           # Minimum 20% downscale limit
         self.max_zoom = 4.0            # Maximum 400% upscale threshold
@@ -1088,25 +1181,27 @@ class LiveEditor(tk.Frame):
 
         # Bind background canvas clicks to clear selection and close properties
         self.canvas.bind("<Button-1>", self._on_canvas_background_click)
-        
-        # Intercepts arrow keys to micro-adjust selected text block positions
-        self.bind_all("<Up>", lambda e: self._on_keyboard_nudge(0, -1, e))
-        self.bind_all("<Down>", lambda e: self._on_keyboard_nudge(0, 1, e))
-        self.bind_all("<Left>", lambda e: self._on_keyboard_nudge(-1, 0, e))
-        self.bind_all("<Right>", lambda e: self._on_keyboard_nudge(1, 0, e))
 
-        # Shift + Arrow Keys for fast 10-pixel jumps
+        # Background page turn workflows mapped to standalone Arrow keys
+        self.bind_all("<Left>", lambda e: self._on_arrow_left_press(e) if not self.property_box_has_focus else None)
+        self.bind_all("<Right>", lambda e: self._on_arrow_right_press(e) if not self.property_box_has_focus else None)
+
+        # Intercepts Alt + Arrow keys to micro-adjust selected text block positions (1-pixel nudge)
+        self.bind_all("<Alt-Up>", lambda e: self._on_keyboard_nudge(0, -1, e))
+        self.bind_all("<Alt-Down>", lambda e: self._on_keyboard_nudge(0, 1, e))
+        self.bind_all("<Alt-Left>", lambda e: self._on_keyboard_nudge(-1, 0, e))
+        self.bind_all("<Alt-Right>", lambda e: self._on_keyboard_nudge(1, 0, e))
+
+        # Shift + Arrow Keys left as-is for fast 10-pixel jumps
         self.bind_all("<Shift-Up>", lambda e: self._on_keyboard_nudge(0, -10, e))
         self.bind_all("<Shift-Down>", lambda e: self._on_keyboard_nudge(0, 10, e))
         self.bind_all("<Shift-Left>", lambda e: self._on_keyboard_nudge(-10, 0, e))
         self.bind_all("<Shift-Right>", lambda e: self._on_keyboard_nudge(10, 0, e))
+
  
     def _build_top_controls(self):
         self.input_frame = tk.Frame(self, bg="#f0f0f0")
         self.input_frame.pack(side="top", fill="x", pady=5)
-
-        # Packed from the right in order:
-        # [Run Inpaint] [Brush Size] [Inpaint Mode] [Fullscreen] [Show BBoxes] [Export Image] [Export All] [Fit to Window] [Exit]
 
         # 1. Exit Button (rightmost)
         self.exit_btn = tk.Button(
@@ -1468,51 +1563,130 @@ class LiveEditor(tk.Frame):
                     tags="inline_bbox_rect"
                 )
             
-        self.canvas.tag_raise("inline_bbox_rect", "bg_layer")
+        #self.canvas.tag_raise("inline_bbox_rect", "bg_layer")
+        self.canvas.tag_raise("inline_bbox_rect")
+
+    def _refresh_sidebar_highlights(self):
+        """
+        Instantly updates sidebar thumbnail button borders to reflect 
+        the currently active index without tearing down the widget layout.
+        """
+        if not hasattr(self, 'scrollable_gallery_frame'):
+            return
+
+        # Scan all packed child elements inside the sidebar scroll framework
+        for widget in self.scrollable_gallery_frame.winfo_children():
+            # Only apply updates if the child element is an interactive thumbnail button
+            if isinstance(widget, tk.Button) and hasattr(widget, '_gallery_idx'):
+                idx = widget._gallery_idx
+                is_active = (idx == self.current_img_index)
+                
+                # Apply the active emerald green vs dark gray styling matrix matching the dark theme
+                border_color = "#00E676" if is_active else "#424242"
+                bg_color = "#1b5e20" if is_active else "#2b2b2b"
+                relief_type = "solid" if is_active else "flat"
+                
+                widget.config(
+                    bg=bg_color,
+                    highlightbackground=border_color,
+                    relief=relief_type
+                )
 
     def exit_program(self):
         """Cleanly releases graphics/memory resources and terminates the program entirely."""
         try:
             self.on_close_cleanup()
             shutdown_event.set()
-            subprocess.run(["killall" , "python"])
             os.exit(0)
         except Exception:
             pass
         finally:
             os._exit(0)
 
+    def _rebuild_sidebar_gallery_widgets(self, scroll_driven=False):
+        """
+        Wipes and systematically repacks sidebar thumb buttons in sorted order.
+        Utilizes a live scroll window viewport to safely manage infinite sets.
+        """
+        total_images = len(self.gallery_images)
+        if total_images == 0:
+            for widget in self.scrollable_gallery_frame.winfo_children():
+                widget.destroy()
+            return
+
+        # Determine our focus baseline anchor
+        if scroll_driven and hasattr(self, '_last_virtual_start'):
+            start_idx = self._last_virtual_start
+        else:
+            current_focus = self.current_img_index if self.current_img_index != -1 else 0
+            start_idx = max(0, current_focus - 25)
+            self._last_virtual_start = start_idx
+
+        window_size = 60
+        end_idx = min(total_images, start_idx + window_size)
+        
+        # Adjust lower bounds securely
+        if end_idx == total_images:
+            start_idx = max(0, end_idx - window_size)
+            self._last_virtual_start = start_idx
+
+        # Clear active layouts right before packing our computed range window 
+        for widget in self.scrollable_gallery_frame.winfo_children():
+            widget.destroy()
+
+        # Place placeholders above to accurately simulate scrollbar height behavior
+        if start_idx > 0:
+            top_spacer = tk.Frame(self.scrollable_gallery_frame, height=start_idx * 96, bg="#e0e0e0")
+            top_spacer.pack(fill="x")
+
+        # Create active interactive button widgets for the visible range slice
+        for idx in range(start_idx, end_idx):
+            self._create_single_gallery_button(idx)
+
+        # Place placeholders below to maintain scrolling proportions
+        if end_idx < total_images:
+            bottom_spacer = tk.Frame(self.scrollable_gallery_frame, height=(total_images - end_idx) * 96, bg="#e0e0e0")
+            bottom_spacer.pack(fill="x")
+            
+        # Dynamically alert the canvas container to calculate its scroll tracking boundaries
+        self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all"))
+
     def _build_main_workspace(self):
-        self.workspace = tk.Frame(self, bg="#dcdcdc")
+        # 1. Darkened outer frame container
+        self.workspace = tk.Frame(self, bg="#121212")
         self.workspace.pack(side="top", fill="both", expand=True)
 
-        self.sidebar_container = tk.Frame(self.workspace, width=150, bg="#e0e0e0", bd=1, relief="sunken")
+        # 2. Darkened sidebar container column layout 
+        self.sidebar_container = tk.Frame(self.workspace, width=150, bg="#212121", bd=1, relief="flat")
         self.sidebar_container.pack(side="left", fill="y")
 
-        self.gallery_canvas = tk.Canvas(self.sidebar_container, width=130, bg="#e0e0e0", bd=0, highlightthickness=0)
-        self.gallery_scrollbar = ttk.Scrollbar(self.sidebar_container, orient="vertical", command=self.gallery_canvas.yview)
-        self.scrollable_gallery_frame = tk.Frame(self.gallery_canvas, bg="#e0e0e0")
+        # 3. Darkened canvas panel tracks
+        self.gallery_canvas = tk.Canvas(self.sidebar_container, width=130, bg="#212121", bd=0, highlightthickness=0)
+        self.gallery_scrollbar = ttk.Scrollbar(self.sidebar_container, orient="vertical", command=self._on_sidebar_scroll_observe)
+        self.scrollable_gallery_frame = tk.Frame(self.gallery_canvas, bg="#212121")
 
         self.scrollable_gallery_frame.bind(
             "<Configure>",
             lambda e: self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all"))
         )
-        self.gallery_canvas.create_window((0, 0), window=self.scrollable_gallery_frame, anchor="nw")
+        self.gallery_canvas.create_window((65, 0), window=self.scrollable_gallery_frame, anchor="n")
         self.gallery_canvas.configure(yscrollcommand=self.gallery_scrollbar.set)
 
         self.gallery_canvas.pack(side="left", fill="both", expand=True)
         self.gallery_scrollbar.pack(side="right", fill="y")
 
-        self.canvas_container = tk.Frame(self.workspace, bg="gray")
+        # 4. Darkened image workspace staging backgrounds
+        self.canvas_container = tk.Frame(self.workspace, bg="#121212")
         self.canvas_container.pack(side="right", fill="both", expand=True)
 
         self.v_scrollbar = ttk.Scrollbar(self.canvas_container, orient="vertical")
         self.h_scrollbar = ttk.Scrollbar(self.canvas_container, orient="horizontal")
 
         self.canvas = tk.Canvas(
-            self.canvas_container, bd=0, highlightthickness=0, bg="gray",
+            self.canvas_container, bd=0, highlightthickness=0, bg="#212121",
             xscrollcommand=self.h_scrollbar.set, yscrollcommand=self.v_scrollbar.set
         )
+
 
         self.v_scrollbar.config(command=self.canvas.yview)
         self.h_scrollbar.config(command=self.canvas.xview)
@@ -1539,7 +1713,7 @@ class LiveEditor(tk.Frame):
         self.canvas.create_text(
             1280/2, 720/2,
             text="No images loaded.\n\nRunning as server...",
-            fill="white", font=("Arial", 12, "italic"), justify="center", tags="placeholder"
+            fill="#888888", font=("Arial", 12, "italic"), justify="center", tags="placeholder"
         )
 
     def append_image(self, image_dict: dict, path: str = "", config: Config = None):
@@ -1701,7 +1875,6 @@ class LiveEditor(tk.Frame):
         region = text_regions[layer_index] if layer_index < len(text_regions) else None
         font_size = str(getattr(region, 'font_size', '')) if region else ""
 
-        # --- EXTRACT UNTRANSLATED OCR ORIGINAL TEXT ---
         original_ocr_text = str(getattr(region, 'text', '')) if region else ""
 
         current_fg = getattr(region, 'fg_color', None) or getattr(region, 'font_color', None)
@@ -2033,21 +2206,6 @@ class LiveEditor(tk.Frame):
 
         text_strings[self.active_layer_index] = updated_text
 
-    def _on_drag_start(self, event, target_id, layer_index):
-        if event.state & 0x0004:
-            return
-
-        self.open_or_update_property_box(layer_index, event)
-
-        self.active_layer_id = target_id
-        self.active_layer_index = layer_index
-        self.canvas.itemconfig(target_id, state="normal")
-        
-        self.drag_data["x"] = event.x
-        self.drag_data["y"] = event.y
-        
-        return "break"  # Prevents event bubbling into the background canvas layer
-
     def _on_render_text_click(self):
         if self.current_img_index == -1:
             return
@@ -2125,37 +2283,125 @@ class LiveEditor(tk.Frame):
             if self.current_img_index != -1 and assigned_index <= self.current_img_index:
                 self.current_img_index += 1
 
-    def _rebuild_sidebar_gallery_widgets(self):
-        """Wipes and systematically repacks sidebar thumb buttons in sorted order."""
-        # Clear any active button widgets packed inside the sidebar frame container
+    def _on_sidebar_scroll_observe(self, *args):
+        """
+        Intercepts canvas adjustments to dynamically swap widgets on the fly
+        based on active viewport scrolling offsets.
+        """
+        # Pass scroll directions cleanly to the underlying canvas widget
+        self.gallery_canvas.yview(*args)
+        
+        # Calculate where the viewport is currently sitting (fractions between 0.0 and 1.0)
+        top_frac, bottom_frac = self.gallery_canvas.yview()
+        total_images = len(self.gallery_images)
+        
+        if total_images <= 60:
+            return
+
+        # Infer approximate index target matching the top of the visible screen space
+        estimated_idx = int(top_frac * total_images)
+        
+        # Detect if the visible workspace drift requires updating our window context
+        if not hasattr(self, '_last_virtual_start'):
+            self._last_virtual_start = 0
+            
+        current_focus = self.current_img_index if self.current_img_index != -1 else 0
+        
+        # If the user has scrolled significantly past our current virtual start point, shift the view
+        if abs(estimated_idx - self._last_virtual_start) > 15:
+            # We debounce slightly by tracking the last trigger point
+            self._last_virtual_start = max(0, estimated_idx - 10)
+            self._rebuild_sidebar_gallery_widgets(scroll_driven=True)
+
+    def _rebuild_sidebar_gallery_widgets(self, scroll_driven=False):
+        total_images = len(self.gallery_images)
+        if total_images == 0:
+            for widget in self.scrollable_gallery_frame.winfo_children():
+                widget.destroy()
+            return
+
+        if scroll_driven and hasattr(self, '_last_virtual_start'):
+            start_idx = self._last_virtual_start
+        else:
+            current_focus = self.current_img_index if self.current_img_index != -1 else 0
+            start_idx = max(0, current_focus - 225)
+            self._last_virtual_start = start_idx
+
+        window_size = 500
+        end_idx = min(total_images, start_idx + window_size)
+        
+        if end_idx == total_images:
+            start_idx = max(0, end_idx - window_size)
+            self._last_virtual_start = start_idx
+
         for widget in self.scrollable_gallery_frame.winfo_children():
             widget.destroy()
+
+        # Bind the inner tracking container frame directly
+        self.scrollable_gallery_frame.bind("<MouseWheel>", self._on_sidebar_mousewheel)
+        self.scrollable_gallery_frame.bind("<Button-4>", self._on_sidebar_mousewheel)
+        self.scrollable_gallery_frame.bind("<Button-5>", self._on_sidebar_mousewheel)
+
+        # Place placeholders above with scrolling hooks attached
+        if start_idx > 0:
+            top_spacer = tk.Frame(self.scrollable_gallery_frame, height=start_idx * 96, bg="#212121")
+            top_spacer.bind("<MouseWheel>", self._on_sidebar_mousewheel)
+            top_spacer.bind("<Button-4>", self._on_sidebar_mousewheel)
+            top_spacer.bind("<Button-5>", self._on_sidebar_mousewheel)
+            top_spacer.pack(fill="x", anchor="center")
+
+        for idx in range(start_idx, end_idx):
+            self._create_single_gallery_button(idx)
+
+        # Place placeholders below with scrolling hooks attached
+        if end_idx < total_images:
+            bottom_spacer = tk.Frame(self.scrollable_gallery_frame, height=(total_images - end_idx) * 96, bg="#212121")
+            bottom_spacer.bind("<MouseWheel>", self._on_sidebar_mousewheel)
+            bottom_spacer.bind("<Button-4>", self._on_sidebar_mousewheel)
+            bottom_spacer.bind("<Button-5>", self._on_sidebar_mousewheel)
+            bottom_spacer.pack(fill="x", anchor="center")
             
-        # Re-instantiate buttons targeting their newly updated sorted indices
-        for idx, bundle in enumerate(self.gallery_images):
-            tk_thumb = self.thumbnail_refs[idx]
-            
-            btn = tk.Button(
-                self.scrollable_gallery_frame,
-                image=tk_thumb,
-                command=lambda current_idx=idx: self.load_background_image_by_index(current_idx),
-                bd=2,
-                relief="groove"
-            )
-            btn.pack(pady=8, padx=10)
+        self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all"))
+
+    def _create_single_gallery_button(self, idx):
+        """Helper abstraction to consistently mount a centered, interactive asset card."""
+        tk_thumb = self.thumbnail_refs[idx]
+        
+        is_active = (idx == self.current_img_index)
+        border_color = "#00E676" if is_active else "#424242"
+        bg_color = "#1b5e20" if is_active else "#2b2b2b"
+
+        btn = tk.Button(
+            self.scrollable_gallery_frame,
+            image=tk_thumb,
+            command=lambda current_idx=idx: self.load_background_image_by_index(current_idx),
+            bd=3,
+            relief="solid" if is_active else "flat",
+            highlightbackground=border_color,
+            bg=bg_color,
+            activebackground="#333333"
+        )
+        
+        btn._gallery_idx = idx
+
+        btn.bind("<MouseWheel>", self._on_sidebar_mousewheel)
+        btn.bind("<Button-4>", self._on_sidebar_mousewheel)
+        btn.bind("<Button-5>", self._on_sidebar_mousewheel)
+
+        btn.pack(pady=6, padx=10, anchor="center")
 
     def load_background_image_by_index(self, target_index: int):
         if not self.gallery_images or not (0 <= target_index < len(self.gallery_images)):
             return
 
-        # Capture the current viewport position fractions before changing the image index
         prev_x_view = self.canvas.xview() if hasattr(self, 'canvas') else (0.0, 1.0)
         prev_y_view = self.canvas.yview() if hasattr(self, 'canvas') else (0.0, 1.0)
         
         self.close_property_box()
         self.current_img_index = target_index
         
-        # Pass the viewport tracking state into the loader
+        self._refresh_sidebar_highlights()
+        
         self.load_background_image(self.gallery_images[target_index], prev_x_view[0], prev_y_view[0])
 
     def load_background_image(self, data_bundle: dict, restore_x: float = 0.0, restore_y: float = 0.0):
@@ -2456,6 +2702,9 @@ class LiveEditor(tk.Frame):
             self.tk_bg_image = None
             self.current_bg_pil = None
             self.winfo_toplevel().destroy()
+            # TODO: REMOVE
+            subprocess.run(["killall" , "realesrgan-ncnn-vulkan"])
+            subprocess.run(["killall" , "python"])
         except Exception as e:
             print(f"Error during widget resource cleanup: {e}")
 
@@ -2516,6 +2765,8 @@ class LiveEditor(tk.Frame):
         self.drag_data["x"] = event.x
         self.drag_data["y"] = event.y
         
+        self.draw_inline_bounding_boxes()
+                
         return "break"  # Prevents event bubbling into the background canvas layer
 
     def _on_drag_end(self, event, target_id, layer_index):
@@ -2639,6 +2890,8 @@ class LiveEditor(tk.Frame):
 
         # Cleanly dismantle and close the active property box frame workflow
         self.close_property_box()
+
+        self.draw_inline_bounding_boxes()        
 
     def execute_manual_lama_mpe_inpaint(self):
         """Pulls drawing contours and processes a background worker thread to execute LamaMPEInpainter."""
